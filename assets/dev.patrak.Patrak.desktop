@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=patrak
+GenericName=Learning Tracker
+Comment=Track daily progress through video courses and books
+Exec={exe}
+Icon=accessories-dictionary-symbolic
+Terminal=false
+Categories=Education;Utility;
+Keywords=learning;course;lecture;mpv;progress;
+StartupNotify=true

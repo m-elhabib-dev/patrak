@@ -1,0 +1,287 @@
+use super::widgets::{
+    clear, done_check, icon_button, label, page, pill_button, progress, row, section,
+};
+use super::{Act, Action};
+use adw::prelude::*;
+use gtk::pango;
+use patrak::progress::{Course, Snapshot, fmt_clock, fmt_duration, item_status};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+pub struct CoursesPage {
+    pub root: adw::NavigationSplitView,
+    inner: Rc<Inner>,
+}
+
+struct Inner {
+    split: adw::NavigationSplitView,
+    list: gtk::ListBox,
+    content_page: adw::NavigationPage,
+    content: gtk::Box,
+    empty: adw::StatusPage,
+    stack: gtk::Stack,
+    /// Course keys in list order.
+    keys: RefCell<Vec<String>>,
+    selected: RefCell<Option<String>>,
+    snapshot: RefCell<Option<Rc<Snapshot>>>,
+    rebuilding: Cell<bool>,
+    act: Act,
+}
+
+impl CoursesPage {
+    pub fn new(act: Act) -> Self {
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::Single)
+            .build();
+        list.add_css_class("navigation-sidebar");
+        let sidebar_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&list)
+            .vexpand(true)
+            .build();
+        let sidebar = adw::NavigationPage::new(&sidebar_scroller, "Courses");
+
+        let (scroller, content) = page(860);
+        let empty = adw::StatusPage::builder()
+            .icon_name("video-x-generic-symbolic")
+            .title("No Courses Yet")
+            .description("Put each course in its own folder inside one of your video folders (Preferences → Library). A single long video works too.")
+            .build();
+        let stack = gtk::Stack::new();
+        stack.add_named(&scroller, Some("course"));
+        stack.add_named(&empty, Some("empty"));
+        let content_page = adw::NavigationPage::new(&stack, "Course");
+
+        let split = adw::NavigationSplitView::builder()
+            .sidebar(&sidebar)
+            .content(&content_page)
+            .min_sidebar_width(280.0)
+            .max_sidebar_width(380.0)
+            .build();
+
+        let inner = Rc::new(Inner {
+            split: split.clone(),
+            list: list.clone(),
+            content_page,
+            content,
+            empty,
+            stack,
+            keys: RefCell::new(Vec::new()),
+            selected: RefCell::new(None),
+            snapshot: RefCell::new(None),
+            rebuilding: Cell::new(false),
+            act,
+        });
+
+        let weak = Rc::downgrade(&inner);
+        list.connect_row_selected(move |_, row| {
+            let (Some(inner), Some(row)) = (weak.upgrade(), row) else {
+                return;
+            };
+            if inner.rebuilding.get() {
+                return;
+            }
+            let key = inner.keys.borrow().get(row.index() as usize).cloned();
+            *inner.selected.borrow_mut() = key;
+            inner.show_selected();
+        });
+        let weak = Rc::downgrade(&inner);
+        list.connect_row_activated(move |_, _| {
+            if let Some(inner) = weak.upgrade() {
+                inner.split.set_show_content(true);
+            }
+        });
+
+        Self { root: split, inner }
+    }
+
+    pub fn update(&self, snap: &Rc<Snapshot>) {
+        *self.inner.snapshot.borrow_mut() = Some(snap.clone());
+        self.inner.rebuild(snap);
+    }
+}
+
+impl Inner {
+    fn rebuild(&self, snap: &Snapshot) {
+        self.rebuilding.set(true);
+        self.list.remove_all();
+        let keys: Vec<String> = snap.courses.iter().map(|c| c.key.clone()).collect();
+        for course in &snap.courses {
+            self.list.append(&sidebar_row(course));
+        }
+
+        // Keep the selection across refreshes; default to the course being studied.
+        let selected = self
+            .selected
+            .borrow()
+            .clone()
+            .filter(|k| keys.contains(k))
+            .or_else(|| {
+                snap.current_course()
+                    .or(snap.courses.first())
+                    .map(|c| c.key.clone())
+            });
+        if let Some(i) = selected
+            .as_ref()
+            .and_then(|k| keys.iter().position(|x| x == k))
+        {
+            self.list
+                .select_row(self.list.row_at_index(i as i32).as_ref());
+        }
+        *self.keys.borrow_mut() = keys;
+        *self.selected.borrow_mut() = selected;
+        self.rebuilding.set(false);
+        self.show_selected();
+    }
+
+    fn show_selected(&self) {
+        let snap = self.snapshot.borrow().clone();
+        let course = snap.as_ref().and_then(|s| {
+            let key = self.selected.borrow().clone()?;
+            s.courses.iter().find(|c| c.key == key)
+        });
+        let Some(course) = course else {
+            self.stack.set_visible_child(&self.empty);
+            self.content_page.set_title("Courses");
+            return;
+        };
+        self.stack.set_visible_child_name("course");
+        self.content_page.set_title(&course.name);
+        self.render(course);
+    }
+
+    fn render(&self, course: &Course) {
+        let act = &self.act;
+        clear(&self.content);
+
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        header.append(&label(&course.name, &["title-1"]));
+        header.append(&label(&summary(course), &["dim-label"]));
+        header.append(&progress(course.fraction, -1));
+        if let Some(start) = course.next {
+            let key = course.key.clone();
+            let label = if course.lectures[start].position > 0.0 {
+                "Resume"
+            } else {
+                "Play Next"
+            };
+            let play = pill_button(label, act, move || Action::Play {
+                course_key: key.clone(),
+                start,
+            });
+            play.set_halign(gtk::Align::Start);
+            play.set_margin_top(8);
+            header.append(&play);
+        }
+        self.content.append(&header);
+
+        let (lectures_box, list) = section(if course.is_single_file() {
+            "Lecture"
+        } else {
+            "Lectures"
+        });
+        for (i, lecture) in course.lectures.iter().enumerate() {
+            let r = row(&lecture.title, &item_status(lecture));
+            let number = label(&(i + 1).to_string(), &["dim-label", "numeric"]);
+            number.set_width_chars(3);
+            number.set_xalign(1.0);
+            r.add_prefix(&number);
+            if Some(i) == course.next {
+                r.set_subtitle(&format!("Up next  ·  {}", item_status(lecture)));
+                r.add_css_class("accent");
+            }
+            let key = course.key.clone();
+            r.add_suffix(&icon_button(
+                "media-playback-start-symbolic",
+                "Play from here",
+                act,
+                move || Action::Play {
+                    course_key: key.clone(),
+                    start: i,
+                },
+            ));
+            let id = lecture.id;
+            r.add_suffix(&icon_button(
+                "document-edit-symbolic",
+                "Notes",
+                act,
+                move || Action::Note(id),
+            ));
+            r.add_suffix(&done_check(id, lecture.is_done(), act));
+            list.append(&r);
+        }
+        self.content.append(&lectures_box);
+
+        if let [lecture] = course.lectures.as_slice()
+            && !lecture.chapters.is_empty()
+        {
+            let current = lecture.current_chapter().map(|(i, _)| i);
+            let (chapters_box, list) = section("Chapters");
+            for (i, ch) in lecture.chapters.iter().enumerate() {
+                let r = row(&ch.title, &fmt_clock(ch.start));
+                let icon = gtk::Image::new();
+                icon.set_pixel_size(16);
+                if Some(i) == current && !lecture.is_done() {
+                    icon.set_icon_name(Some("media-playback-start-symbolic"));
+                } else if lecture.is_done() || lecture.position > ch.start {
+                    icon.set_icon_name(Some("object-select-symbolic"));
+                }
+                r.add_prefix(&icon);
+                let (id, secs) = (lecture.id, ch.start);
+                r.add_suffix(&icon_button(
+                    "media-playback-start-symbolic",
+                    "Play this chapter",
+                    act,
+                    move || Action::PlayAt { item_id: id, secs },
+                ));
+                list.append(&r);
+            }
+            self.content.append(&chapters_box);
+        }
+    }
+}
+
+fn summary(course: &Course) -> String {
+    let mut parts = vec![format!(
+        "{}/{} lectures",
+        course.done,
+        course.lectures.len()
+    )];
+    if course.total_secs > 0.0 {
+        parts.push(format!("{:.0}%", course.fraction * 100.0));
+    }
+    if course.remaining_secs > 0.0 {
+        parts.push(format!("{} left", fmt_duration(course.remaining_secs)));
+    }
+    if let Some(eta) = course.eta {
+        parts.push(format!("ETA {}", eta.format("%b %-d")));
+    }
+    parts.join("  ·  ")
+}
+
+fn sidebar_row(course: &Course) -> gtk::ListBoxRow {
+    let vbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    let name = gtk::Label::builder()
+        .label(&course.name)
+        .xalign(0.0)
+        .ellipsize(pango::EllipsizeMode::End)
+        .tooltip_text(&course.name)
+        .build();
+    name.add_css_class("heading");
+    let meta = gtk::Label::builder()
+        .label(summary(course))
+        .xalign(0.0)
+        .ellipsize(pango::EllipsizeMode::End)
+        .build();
+    meta.add_css_class("caption");
+    meta.add_css_class("dim-label");
+    vbox.append(&name);
+    vbox.append(&meta);
+    vbox.append(&progress(course.fraction, -1));
+    gtk::ListBoxRow::builder().child(&vbox).build()
+}
