@@ -117,11 +117,23 @@ fn is_hidden(p: &Path) -> bool {
     file_name(p).starts_with('.')
 }
 
-/// yt-dlp leftovers such as `x.f137.mp4.part` end in `.part`, so they never match.
+/// yt-dlp leftovers such as `x.f137.mp4.part` end in `.part`, so they never match. While yt-dlp
+/// is still working it also leaves `x.f137.mp4` (one stream before merging) and `x.temp.mp4`
+/// (while embedding chapters), which are skipped too.
 fn has_ext(p: &Path, exts: &[&str]) -> bool {
-    p.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
+    let inner = p
+        .file_stem()
+        .map(Path::new)
+        .and_then(Path::extension)
+        .and_then(|e| e.to_str());
+    let intermediate = inner.is_some_and(|e| {
+        e == "temp"
+            || (e.len() > 1 && e.starts_with('f') && e[1..].bytes().all(|b| b.is_ascii_digit()))
+    });
+    !intermediate
+        && p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
 fn file_name(p: &Path) -> String {
@@ -280,6 +292,8 @@ mod tests {
             "Episode 2 ｜ State Machine Replication.mp4",
             "Episode 1 ｜ Why distributed systems？.mp4",
             "Episode 3 ｜ Raft.f137.mp4.part",
+            "Episode 4 ｜ Clocks.f137.mp4",
+            "Episode 4 ｜ Clocks.temp.mp4",
             ".hidden.mp4",
             "notes/Episode 1.md",
             "cover.jpg",

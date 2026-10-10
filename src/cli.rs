@@ -1,13 +1,17 @@
 use anyhow::{Context, Result, bail};
-use chrono::{Datelike, Duration};
+use chrono::{Datelike, Duration, NaiveDate};
 use patrak::Session;
-use patrak::db::{Item, Kind};
+use patrak::db::{self, Item, Kind};
 use patrak::progress::{Course, Snapshot, fmt_clock, fmt_duration, item_status};
-use patrak::{config::Config, launch, setup, sync::set_done};
+use patrak::review::{self, Card, Grade};
+use patrak::{config::Config, download, launch, setup, sync::set_done};
+use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 fn color() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -82,6 +86,40 @@ fn print_today(snap: &Snapshot) {
         }
     }
 
+    let plan = snap.plan();
+    if !plan.is_empty() {
+        println!("\n{}", bold("Plan"));
+        for c in plan {
+            let need = c.needed_per_day(snap.today).unwrap_or(0.0);
+            let share = if need > 0.0 { c.today_secs / need } else { 1.0 };
+            println!(
+                "  {}  {:>4} of {:<4} today  {}",
+                bar(share, 10),
+                fmt_duration(c.today_secs),
+                fmt_duration(need),
+                bold(&c.name)
+            );
+            if let Some(summary) = c.plan_summary(snap.today) {
+                println!("  {}", dim(&summary));
+            }
+        }
+    }
+
+    if snap.cards_total > 0 {
+        println!("\n{}", bold("Review"));
+        if snap.cards_due > 0 {
+            println!("  {} cards due   {}", snap.cards_due, dim("patrak review"));
+        } else {
+            println!(
+                "  {}",
+                dim(&format!(
+                    "all caught up ({} reviewed today)",
+                    snap.reviewed_today
+                ))
+            );
+        }
+    }
+
     println!("\n{}", bold("Next up"));
     match snap.current_course() {
         Some(course) => {
@@ -111,7 +149,7 @@ pub fn status(query: Option<String>) -> Result<()> {
     let course = one(snap.find_courses(&query), "course", &query, |c| {
         c.name.clone()
     })?;
-    print_course(course);
+    print_course(course, snap.today);
     Ok(())
 }
 
@@ -141,6 +179,18 @@ fn print_overview(snap: &Snapshot) {
             dim(&eta),
             bold(&c.name)
         );
+        if let Some(summary) = c.plan_summary(snap.today) {
+            println!("        {}", dim(&summary));
+        }
+        if let Some(source) = c.source.as_ref().filter(|s| !s.new_titles.is_empty()) {
+            println!(
+                "        {}",
+                green(&format!(
+                    "{} new episodes · patrak update",
+                    source.new_titles.len()
+                ))
+            );
+        }
     }
     println!("\n{}", bold("Books"));
     if snap.books.is_empty() {
@@ -158,7 +208,7 @@ fn print_overview(snap: &Snapshot) {
     }
 }
 
-fn print_course(c: &Course) {
+fn print_course(c: &Course, today: NaiveDate) {
     println!(
         "{}  {}/{} lectures · {:.0}% · {} left",
         bold(&c.name),
@@ -167,6 +217,16 @@ fn print_course(c: &Course) {
         c.fraction * 100.0,
         fmt_duration(c.remaining_secs)
     );
+    if let Some(summary) = c.plan_summary(today) {
+        println!("{}", dim(&summary));
+    }
+    if let Some(source) = &c.source {
+        let new = match source.new_titles.len() {
+            0 => "no new episodes at last check".to_owned(),
+            n => format!("{n} new episodes · patrak update"),
+        };
+        println!("{}", dim(&format!("{}  ·  {new}", source.url)));
+    }
     for (i, l) in c.lectures.iter().enumerate() {
         let arrow = if Some(i) == c.next { "→" } else { " " };
         println!(
@@ -188,7 +248,7 @@ fn print_course(c: &Course) {
             } else if lecture.position > ch.start || lecture.is_done() {
                 "✓"
             } else {
-                "·"
+                "○"
             };
             println!("      {mark} {:>8}  {}", fmt_clock(ch.start), ch.title);
         }
@@ -240,7 +300,8 @@ pub fn note(query: Option<String>) -> Result<()> {
     };
     let path = launch::ensure_note(item)?;
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
-    run(vec![editor.into(), path.into_os_string()])
+    run(vec![editor.into(), path.into_os_string()])?;
+    Ok(())
 }
 
 pub fn mark(query: String, done: bool) -> Result<()> {
@@ -375,6 +436,179 @@ pub fn setup(force: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn deadline(query: String, when: String) -> Result<()> {
+    let (session, snap) = session()?;
+    let course = one(snap.find_courses(&query), "course", &query, |c| {
+        c.name.clone()
+    })?;
+    let date = parse_when(&when, snap.today)?;
+    db::set_deadline(&session.conn, &course.key, date)?;
+    let snap = session.snapshot()?;
+    let course = snap
+        .courses
+        .iter()
+        .find(|c| c.key == course.key)
+        .context("course vanished")?;
+    match course.plan_summary(snap.today) {
+        Some(summary) => println!("{}\n{}", bold(&course.name), summary),
+        None => println!("{}: no deadline", course.name),
+    }
+    Ok(())
+}
+
+/// `2026-11-15`, `+10` / `+10d` (days), `+3w` (weeks), `+2m` (months of 30 days), or `clear`.
+fn parse_when(when: &str, today: NaiveDate) -> Result<Option<NaiveDate>> {
+    let when = when.trim().to_lowercase();
+    if matches!(when.as_str(), "clear" | "none" | "off") {
+        return Ok(None);
+    }
+    if let Some(rel) = when.strip_prefix('+') {
+        let (n, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
+        let n: i64 = n.parse().with_context(|| format!("can't read {when:?}"))?;
+        let days = match unit {
+            "" | "d" => n,
+            "w" => n * 7,
+            "m" => n * 30,
+            _ => bail!("unknown unit in {when:?}; use d, w or m"),
+        };
+        return Ok(Some(today + Duration::days(days)));
+    }
+    NaiveDate::parse_from_str(&when, "%Y-%m-%d")
+        .map(Some)
+        .with_context(|| format!("{when:?} isn't a date like 2026-11-15, +3w or clear"))
+}
+
+pub fn add(url: String, name: Option<String>) -> Result<()> {
+    let mut session = Session::open()?;
+    println!("{}", dim(&format!("Looking up {url} …")));
+    let plan = download::plan(&session.cfg, &url, name.as_deref())?;
+    println!("Downloading {}", bold(&plan.describe()));
+    download::prepare(&plan)?;
+    if !run(download::download_args(&session.cfg, &plan, false))? {
+        bail!("download stopped; run `patrak update` to resume it");
+    }
+    download::finish(&plan)?;
+    after_launch(&mut session)
+}
+
+pub fn update(query: Option<String>, check_only: bool) -> Result<()> {
+    let mut session = Session::open()?;
+    let dirs: Vec<PathBuf> = download::source_dirs(&session.cfg)
+        .into_iter()
+        .filter(|d| {
+            let name = d
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            query
+                .as_deref()
+                .is_none_or(|q| name.contains(&q.to_lowercase()))
+        })
+        .collect();
+    if dirs.is_empty() {
+        bail!("no downloaded courses match; add one with `patrak add <playlist-url>`");
+    }
+    let mut downloaded = false;
+    for dir in dirs {
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let new =
+            download::check(&session.cfg, &dir).with_context(|| format!("checking {name}"))?;
+        if new.is_empty() {
+            println!("{}  {}", bold(&name), dim("up to date"));
+            continue;
+        }
+        println!("{}  {}", bold(&name), green(&format!("{} new", new.len())));
+        for title in &new {
+            println!("  + {title}");
+        }
+        if check_only {
+            continue;
+        }
+        let plan = download::update_plan(&dir).context("course has no source")?;
+        if run(download::download_args(&session.cfg, &plan, false))? {
+            download::finish(&plan)?;
+            downloaded = true;
+        }
+    }
+    if downloaded {
+        after_launch(&mut session)?;
+    }
+    Ok(())
+}
+
+pub fn review() -> Result<()> {
+    let (session, snap) = session()?;
+    let mut queue: VecDeque<Card> = review::due(&session.conn, snap.today)?.into();
+    if queue.is_empty() {
+        match snap.cards_total {
+            0 => println!(
+                "No review cards yet. In a lecture's notes (patrak note), write\n\n  Q: a question\n  A: its answer\n"
+            ),
+            n => println!(
+                "Nothing due. {n} cards, {} reviewed today.",
+                snap.reviewed_today
+            ),
+        }
+        return Ok(());
+    }
+    let total = queue.len();
+    let mut finished = 0;
+    let keys = "[1] again  [2] hard  [3] good  [4] easy  [q] stop";
+    while let Some(card) = queue.pop_front() {
+        println!(
+            "\n{}  {}",
+            dim(&format!("{}/{total}", finished + 1)),
+            dim(&card.source())
+        );
+        println!("{}", bold(&card.question));
+        let shown = Instant::now();
+        if prompt(&dim("Enter shows the answer, q stops"))?.is_none_or(|l| l == "q") {
+            break;
+        }
+        println!("{}\n", card.answer);
+        let when: Vec<String> = Grade::ALL
+            .iter()
+            .map(|g| format!("{} {}", g.label(), card.preview(*g)))
+            .collect();
+        println!("{}", dim(&when.join(" · ")));
+        let grade = loop {
+            match prompt(keys)? {
+                None => return Ok(()),
+                Some(l) if l == "q" => return Ok(()),
+                Some(l) => match l.chars().next().and_then(Grade::from_key) {
+                    Some(g) => break g,
+                    None => continue,
+                },
+            }
+        };
+        let next = review::grade(
+            &session.conn,
+            &card,
+            grade,
+            snap.today,
+            shown.elapsed().as_secs_f64(),
+        )?;
+        if grade == Grade::Again {
+            queue.push_back(next);
+        } else {
+            finished += 1;
+        }
+    }
+    println!("\nReviewed {finished} of {total} cards.");
+    Ok(())
+}
+
+/// Prints `text` and reads a trimmed line; `None` at end of input.
+fn prompt(text: &str) -> Result<Option<String>> {
+    print!("{text} › ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    Ok((std::io::stdin().read_line(&mut line)? > 0).then(|| line.trim().to_lowercase()))
+}
+
 /// The course to play and the lecture index to start from.
 fn pick_course<'a>(snap: &'a Snapshot, query: Option<&str>) -> Result<(&'a Course, usize)> {
     let Some(q) = query else {
@@ -427,7 +661,8 @@ fn one<'a, T>(
     }
 }
 
-fn run(args: Vec<OsString>) -> Result<()> {
+/// Runs a program in the foreground; returns whether it succeeded.
+fn run(args: Vec<OsString>) -> Result<bool> {
     let (program, rest) = args.split_first().context("empty command")?;
     let status = Command::new(program)
         .args(rest)
@@ -436,7 +671,7 @@ fn run(args: Vec<OsString>) -> Result<()> {
     if !status.success() {
         eprintln!("{} exited with {status}", program.to_string_lossy());
     }
-    Ok(())
+    Ok(status.success())
 }
 
 fn after_launch(session: &mut Session) -> Result<()> {
@@ -447,4 +682,22 @@ fn after_launch(session: &mut Session) -> Result<()> {
     println!();
     print_today(&session.snapshot()?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_deadlines() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+        let d = |s| Some(NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap());
+        assert_eq!(parse_when("2026-11-15", today).unwrap(), d("2026-11-15"));
+        assert_eq!(parse_when("+10", today).unwrap(), d("2026-10-21"));
+        assert_eq!(parse_when("+3w", today).unwrap(), d("2026-11-01"));
+        assert_eq!(parse_when("+1m", today).unwrap(), d("2026-11-10"));
+        assert_eq!(parse_when("clear", today).unwrap(), None);
+        assert!(parse_when("+3y", today).is_err());
+        assert!(parse_when("next friday", today).is_err());
+    }
 }

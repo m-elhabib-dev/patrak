@@ -24,6 +24,10 @@ pub struct Config {
     pub terminal: String,
     pub mpv_watch_later_dir: String,
     pub zathura_db: String,
+    /// yt-dlp binary used by `patrak add` and `patrak update`.
+    pub yt_dlp: String,
+    /// Extra yt-dlp options, e.g. `["-S", "res:1080", "--cookies-from-browser", "firefox"]`.
+    pub yt_dlp_args: Vec<String>,
 }
 
 impl Default for Config {
@@ -39,6 +43,8 @@ impl Default for Config {
             terminal: "kitty".into(),
             mpv_watch_later_dir: "~/.local/state/mpv/watch_later".into(),
             zathura_db: "~/.local/share/zathura/bookmarks.sqlite".into(),
+            yt_dlp: "yt-dlp".into(),
+            yt_dlp_args: vec!["-S".into(), "res:1080".into()],
         }
     }
 }

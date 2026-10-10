@@ -50,6 +50,69 @@ The library is synced every time the GUI refreshes and every time a CLI command 
 the window updates about once a minute. Study done before `day_starts_at` (04:00 by default) counts for the
 previous day.
 
+## Deadlines
+
+Give a course a deadline in its **Plan** row (Courses page) or with `patrak deadline <course> <when>`.
+`<when>` is a date like `2026-11-15`, a relative time like `+3w`, `+10d` or `+2m`, or `clear`.
+
+- patrak works out how much you need to watch each day to finish on time.
+- It compares that with your recent pace (averaged over up to 14 days) and marks the course
+  *on track*, *behind* or *overdue*.
+- **Today's plan** lists each course's share for today.
+- `patrak play` with no course name, and the Continue card, pick the course furthest behind on
+  today's share.
+
+## Courses from YouTube
+
+```sh
+patrak add "https://www.youtube.com/playlist?list=…"    # or the + button in the window
+patrak update                                           # fetch new episodes of every added course
+patrak update --check                                   # only list what's new
+```
+
+- A playlist becomes a course folder in your first video folder, with files named
+  `001 - Title.mp4`, so lectures play in playlist order.
+- If the folder already exists (made by plain yt-dlp, say), new files are named
+  `Title.mp4` so the videos already there are recognised.
+- Each folder gets two hidden files: `.patrak-source.json` and `.patrak-archive.txt`, the record
+  of downloaded videos. Moving the folder keeps the link.
+- The window checks each playlist for new episodes about once a day.
+
+yt-dlp options come from `yt_dlp` and `yt_dlp_args` in `config.toml`. If YouTube refuses downloads
+(HTTP 403), update yt-dlp or add browser cookies:
+
+```toml
+yt_dlp = "/usr/bin/yt-dlp"
+yt_dlp_args = ["-S", "res:1080", "--cookies-from-browser", "firefox"]
+```
+
+## Notes
+
+Every lecture and book has a Markdown note at `<course folder>/notes/<file name>.md`, created when
+you first open it. Open a note with the pencil button, or with `patrak note [query]` to use `$EDITOR`.
+
+- The notes window saves as you type.
+- The clock button inserts the current position: `[12:30]` for a video, `[p. 42]` for a book.
+- In the window, stamps show as links. Click one to play the lecture from that moment (`mpv --start`)
+  or open the book at that page (`zathura --page`).
+- Stamps you type yourself work too, in `mm:ss`, `h:mm:ss` or `p. N` form.
+
+## Review cards
+
+Write questions in a lecture's notes (`patrak note`, or the notes button):
+
+```markdown
+Q: What does Raft guarantee about committed entries?
+A: Every future leader has them.
+```
+
+- The answer is everything after the question up to a blank line, the next `Q:` or a heading.
+  The `A:` prefix is optional.
+- Cards are scheduled like Anki (Again / Hard / Good / Easy).
+- Review them in the window's **Review** dialog (Space shows the answer, keys 1–4 grade it) or
+  with `patrak review`.
+- Review time counts toward the daily goal.
+
 ## CLI
 
 ```
@@ -60,6 +123,10 @@ patrak play [query]      play a course in mpv from the next lecture; mpv moves o
 patrak read [book]       open a book in zathura
 patrak note [query]      edit notes in $EDITOR
 patrak done/reset <q>    mark a lecture or book done or not done
+patrak deadline <c> <w>  set or clear a course deadline
+patrak add <url>         download a playlist as a course (--name to choose the folder)
+patrak update [course]   download new episodes (--check to only list them)
+patrak review            review the cards due today
 patrak stats             heatmap, streaks, weekly totals
 patrak sync -v           rescan and show what changed
 ```

@@ -1,6 +1,6 @@
 use super::widgets::{
-    done_check, icon_button, isolate, label, page, pill_button, placeholder_row, row, section,
-    value_label,
+    done_check, icon_button, isolate, label, page, pill_button, placeholder_row, progress, row,
+    section, value_label,
 };
 use super::{Act, Action};
 use adw::prelude::*;
@@ -15,7 +15,11 @@ pub struct TodayPage {
     remaining: gtk::Label,
     streak: gtk::Label,
     best: gtk::Label,
+    plan_box: gtk::Box,
+    plan_list: gtk::ListBox,
     continue_list: gtk::ListBox,
+    review_box: gtk::Box,
+    review_list: gtk::ListBox,
     today_list: gtk::ListBox,
     act: Act,
 }
@@ -47,9 +51,13 @@ impl TodayPage {
         cards.append(&best_card);
         content.append(&cards);
 
+        let (plan_box, plan_list) = section("Today’s Plan");
         let (continue_box, continue_list) = section("Continue");
+        let (review_box, review_list) = section("Review");
         let (today_box, today_list) = section("Studied today");
+        content.append(&plan_box);
         content.append(&continue_box);
+        content.append(&review_box);
         content.append(&today_box);
 
         Self {
@@ -60,7 +68,11 @@ impl TodayPage {
             remaining,
             streak,
             best,
+            plan_box,
+            plan_list,
             continue_list,
+            review_box,
+            review_list,
             today_list,
             act,
         }
@@ -132,6 +144,75 @@ impl TodayPage {
             r.add_suffix(&pill_button("Read", act, move || Action::Read(id)));
             self.continue_list.append(&r);
         }
+
+        self.plan_list.remove_all();
+        let plan = snap.plan();
+        self.plan_box.set_visible(!plan.is_empty());
+        for course in plan {
+            let need = course.needed_per_day(snap.today).unwrap_or(0.0);
+            let share = if need > 0.0 {
+                course.today_secs / need
+            } else {
+                1.0
+            };
+            let today_part = if need > 0.0 {
+                format!(
+                    "{} of {} today",
+                    fmt_duration(course.today_secs),
+                    fmt_duration(need)
+                )
+            } else {
+                String::new()
+            };
+            let summary = course.plan_summary(snap.today).unwrap_or_default();
+            let subtitle = [today_part, summary]
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join("  ·  ");
+            let r = row(&course.name, &subtitle);
+            r.set_subtitle_lines(2);
+            if share >= 1.0 {
+                r.add_prefix(&gtk::Image::from_icon_name("object-select-symbolic"));
+            }
+            r.add_suffix(&progress(share, 90));
+            if let Some(start) = course.next {
+                let key = course.key.clone();
+                r.add_suffix(&pill_button("Play", act, move || Action::Play {
+                    course_key: key.clone(),
+                    start,
+                }));
+            }
+            self.plan_list.append(&r);
+        }
+
+        self.review_list.remove_all();
+        self.review_box.set_visible(snap.cards_total > 0);
+        let r = if snap.cards_due > 0 {
+            let r = row(
+                &format!(
+                    "{} card{} due",
+                    snap.cards_due,
+                    if snap.cards_due == 1 { "" } else { "s" }
+                ),
+                &format!(
+                    "{} cards in your notes  ·  {} reviewed today",
+                    snap.cards_total, snap.reviewed_today
+                ),
+            );
+            r.add_suffix(&pill_button("Review", act, || Action::Review));
+            r
+        } else {
+            row(
+                "All caught up",
+                &format!(
+                    "{} cards in your notes  ·  {} reviewed today",
+                    snap.cards_total, snap.reviewed_today
+                ),
+            )
+        };
+        r.add_prefix(&gtk::Image::from_icon_name("dialog-question-symbolic"));
+        self.review_list.append(&r);
 
         self.today_list.remove_all();
         if snap.today_entries.is_empty() {

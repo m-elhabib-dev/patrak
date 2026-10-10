@@ -3,8 +3,12 @@ use super::widgets::{
 };
 use super::{Act, Action};
 use adw::prelude::*;
+use chrono::{Datelike, NaiveDate};
+use gtk::glib;
 use gtk::pango;
-use patrak::progress::{Course, Snapshot, fmt_clock, fmt_duration, item_status};
+use patrak::config;
+use patrak::download::Source;
+use patrak::progress::{Course, PlanStatus, Snapshot, fmt_clock, fmt_duration, item_status};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -147,10 +151,14 @@ impl Inner {
         };
         self.stack.set_visible_child_name("course");
         self.content_page.set_title(&course.name);
-        self.render(course);
+        self.render(
+            course,
+            snap.as_ref()
+                .map_or_else(|| chrono::Local::now().date_naive(), |s| s.today),
+        );
     }
 
-    fn render(&self, course: &Course) {
+    fn render(&self, course: &Course, today: NaiveDate) {
         let act = &self.act;
         clear(&self.content);
 
@@ -174,6 +182,13 @@ impl Inner {
             header.append(&play);
         }
         self.content.append(&header);
+
+        let (plan_box, plan_list) = section("Plan");
+        plan_list.append(&deadline_row(course, today, act));
+        if let Some(source) = &course.source {
+            plan_list.append(&source_row(course, source, act));
+        }
+        self.content.append(&plan_box);
 
         let (lectures_box, list) = section(if course.is_single_file() {
             "Lecture"
@@ -253,10 +268,136 @@ fn summary(course: &Course) -> String {
     if course.remaining_secs > 0.0 {
         parts.push(format!("{} left", fmt_duration(course.remaining_secs)));
     }
-    if let Some(eta) = course.eta {
+    if let Some(deadline) = course.deadline {
+        parts.push(format!("due {}", deadline.format("%b %-d")));
+    } else if let Some(eta) = course.eta {
         parts.push(format!("ETA {}", eta.format("%b %-d")));
     }
+    if let Some(n) = course
+        .source
+        .as_ref()
+        .map(|s| s.new_titles.len())
+        .filter(|&n| n > 0)
+    {
+        parts.push(format!("{n} new"));
+    }
     parts.join("  ·  ")
+}
+
+/// The deadline with a calendar to change it.
+fn deadline_row(course: &Course, today: NaiveDate, act: &Act) -> adw::ActionRow {
+    let subtitle = course
+        .plan_summary(today)
+        .unwrap_or_else(|| "None. Set one to get a daily share in Today’s plan.".into());
+    let r = row("Deadline", &subtitle);
+    r.set_subtitle_lines(2);
+    if course.plan_status(today) == Some(PlanStatus::Behind)
+        || course.plan_status(today) == Some(PlanStatus::Overdue)
+    {
+        r.add_css_class("warning");
+    }
+    r.add_prefix(&gtk::Image::from_icon_name("x-office-calendar-symbolic"));
+
+    let calendar = gtk::Calendar::new();
+    let initial = course
+        .deadline
+        .unwrap_or(today + chrono::Duration::weeks(4));
+    if let Ok(dt) = glib::DateTime::from_local(
+        initial.year(),
+        initial.month() as i32,
+        initial.day() as i32,
+        12,
+        0,
+        0.0,
+    ) {
+        calendar.select_day(&dt);
+    }
+    let set = gtk::Button::builder().label("Set Deadline").build();
+    set.add_css_class("suggested-action");
+    let popover_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    popover_box.append(&calendar);
+    popover_box.append(&set);
+    let popover = gtk::Popover::builder().child(&popover_box).build();
+    let choose = gtk::MenuButton::builder()
+        .icon_name("x-office-calendar-symbolic")
+        .tooltip_text("Choose a deadline")
+        .popover(&popover)
+        .valign(gtk::Align::Center)
+        .build();
+    choose.add_css_class("flat");
+    let (key, act2, pop) = (course.key.clone(), act.clone(), popover.clone());
+    set.connect_clicked(move |_| {
+        let dt = calendar.date();
+        let date = NaiveDate::from_ymd_opt(dt.year(), dt.month() as u32, dt.day_of_month() as u32);
+        pop.popdown();
+        act2(Action::SetDeadline(key.clone(), date));
+    });
+    if course.deadline.is_some() {
+        let key = course.key.clone();
+        r.add_suffix(&icon_button(
+            "edit-clear-symbolic",
+            "Remove the deadline",
+            act,
+            move || Action::SetDeadline(key.clone(), None),
+        ));
+    }
+    r.add_suffix(&choose);
+    r
+}
+
+/// Where a downloaded course comes from, with buttons to check and fetch new episodes.
+fn source_row(course: &Course, source: &Source, act: &Act) -> adw::ActionRow {
+    let checked = source
+        .checked_at
+        .map(|t| format!("checked {}", ago(config::now() - t)))
+        .unwrap_or_else(|| "not checked yet".into());
+    let new = match source.new_titles.len() {
+        0 => "no new episodes".to_owned(),
+        1 => format!("new: {}", source.new_titles[0]),
+        n => format!("{n} new episodes"),
+    };
+    let r = row("YouTube playlist", &format!("{new}  ·  {checked}"));
+    r.add_prefix(&gtk::Image::from_icon_name("folder-download-symbolic"));
+    if !source.new_titles.is_empty() {
+        r.set_tooltip_text(Some(&source.new_titles.join("\n")));
+    }
+    let url = source.url.clone();
+    r.add_suffix(&icon_button(
+        "web-browser-symbolic",
+        "Open the playlist",
+        act,
+        move || Action::OpenUrl(url.clone()),
+    ));
+    let dir = course.dir.clone();
+    r.add_suffix(&icon_button(
+        "view-refresh-symbolic",
+        "Check for new episodes",
+        act,
+        move || Action::CheckCourse(dir.clone()),
+    ));
+    let dir = course.dir.clone();
+    let download = pill_button("Download New", act, move || {
+        Action::UpdateCourse(dir.clone())
+    });
+    download.set_sensitive(!source.new_titles.is_empty() || source.checked_at.is_none());
+    r.add_suffix(&download);
+    r
+}
+
+fn ago(secs: i64) -> String {
+    match secs {
+        s if s < 90 => "just now".into(),
+        s if s < 5400 => format!("{} min ago", s / 60),
+        s if s < 2 * 86400 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86400),
+    }
 }
 
 fn sidebar_row(course: &Course) -> gtk::ListBoxRow {

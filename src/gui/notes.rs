@@ -1,9 +1,9 @@
-use super::App;
 use super::widgets::label;
+use super::{Action, App};
 use adw::prelude::*;
-use gtk::glib;
-use patrak::db::Item;
-use patrak::launch;
+use gtk::{gdk, glib, pango};
+use patrak::db::{Item, Kind};
+use patrak::launch::{self, Stamp};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -29,6 +29,8 @@ pub fn show(app: &Rc<App>, item: Item) {
         .vexpand(true)
         .build();
     let scroller = gtk::ScrolledWindow::builder().child(&view).build();
+    let stamps = StampLinks::new(&buffer, item.kind);
+    stamps.attach(app, &view, item.id);
 
     let stamp = gtk::Button::builder()
         .icon_name("alarm-symbolic")
@@ -42,7 +44,18 @@ pub fn show(app: &Rc<App>, item: Item) {
     header.pack_start(&stamp);
     header.pack_start(&editor);
 
-    let path_label = label(&path.display().to_string(), &["caption", "dim-label"]);
+    let path_label = label(
+        &format!(
+            "{}\nClick a {} stamp to jump there. Q: question / A: answer lines become review cards.",
+            path.display(),
+            if item.kind == Kind::Book {
+                "[p. 42]"
+            } else {
+                "[12:30]"
+            }
+        ),
+        &["caption", "dim-label"],
+    );
     path_label.set_margin_start(12);
     path_label.set_margin_end(12);
     path_label.set_margin_top(6);
@@ -67,7 +80,10 @@ pub fn show(app: &Rc<App>, item: Item) {
         pending: RefCell::new(None),
     });
     let s = saver.clone();
-    buffer.connect_changed(move |_| s.schedule());
+    buffer.connect_changed(move |_| {
+        s.schedule();
+        stamps.highlight();
+    });
 
     let (weak_app, id) = (Rc::downgrade(app), item.id);
     let b = buffer.clone();
@@ -154,5 +170,96 @@ impl Saver {
                 id.remove();
             }
         }
+    }
+}
+
+/// Underlines `[12:30]` / `[p. 42]` stamps and opens the lecture or book there when clicked.
+#[derive(Clone)]
+struct StampLinks {
+    buffer: gtk::TextBuffer,
+    tag: gtk::TextTag,
+    kind: Kind,
+}
+
+impl StampLinks {
+    fn new(buffer: &gtk::TextBuffer, kind: Kind) -> Self {
+        let tag = gtk::TextTag::builder()
+            .name("stamp")
+            .underline(pango::Underline::Single)
+            .build();
+        tag.set_foreground_rgba(Some(&adw::StyleManager::default().accent_color_rgba()));
+        buffer.tag_table().add(&tag);
+        let links = Self {
+            buffer: buffer.clone(),
+            tag,
+            kind,
+        };
+        links.highlight();
+        links
+    }
+
+    fn stamps(&self) -> Vec<(usize, usize, Stamp)> {
+        let text = self
+            .buffer
+            .text(&self.buffer.start_iter(), &self.buffer.end_iter(), false);
+        launch::find_stamps(&text)
+            .into_iter()
+            .filter(|s| s.2.fits(self.kind))
+            .collect()
+    }
+
+    fn highlight(&self) {
+        let b = &self.buffer;
+        b.remove_tag(&self.tag, &b.start_iter(), &b.end_iter());
+        for (start, end, _) in self.stamps() {
+            b.apply_tag(
+                &self.tag,
+                &b.iter_at_offset(start as i32),
+                &b.iter_at_offset(end as i32),
+            );
+        }
+    }
+
+    /// The stamp under widget coordinates (x, y), if any.
+    fn at(&self, view: &gtk::TextView, x: f64, y: f64) -> Option<Stamp> {
+        let (bx, by) =
+            view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        let iter = view.iter_at_location(bx, by)?;
+        if !iter.has_tag(&self.tag) {
+            return None;
+        }
+        let offset = iter.offset() as usize;
+        self.stamps()
+            .into_iter()
+            .find(|&(s, e, _)| s <= offset && offset < e)
+            .map(|s| s.2)
+    }
+
+    fn attach(&self, app: &Rc<App>, view: &gtk::TextView, item_id: i64) {
+        let click = gtk::GestureClick::new();
+        click.set_button(gdk::BUTTON_PRIMARY);
+        let (links, v, weak) = (self.clone(), view.clone(), Rc::downgrade(app));
+        click.connect_released(move |_, presses, x, y| {
+            // A drag selects text; only a plain single click follows the stamp.
+            if presses != 1 || links.buffer.has_selection() {
+                return;
+            }
+            let (Some(stamp), Some(app)) = (links.at(&v, x, y), weak.upgrade()) else {
+                return;
+            };
+            app.handle(match stamp {
+                Stamp::Time(secs) => Action::PlayAt { item_id, secs },
+                Stamp::Page(page) => Action::ReadAt { item_id, page },
+            });
+        });
+        view.add_controller(click);
+
+        let motion = gtk::EventControllerMotion::new();
+        let (links, v) = (self.clone(), view.clone());
+        motion.connect_motion(move |_, x, y| {
+            let over = links.at(&v, x, y).is_some();
+            v.set_cursor_from_name(Some(if over { "pointer" } else { "text" }));
+        });
+        view.add_controller(motion);
     }
 }

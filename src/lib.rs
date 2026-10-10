@@ -1,8 +1,10 @@
 pub mod config;
 pub mod db;
+pub mod download;
 pub mod launch;
 pub mod library;
 pub mod progress;
+pub mod review;
 pub mod setup;
 pub mod sources;
 pub mod sync;

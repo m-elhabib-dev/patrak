@@ -2,6 +2,7 @@ use crate::config::{self, Config, Paths};
 use crate::db::{self, Item, Kind};
 use crate::library;
 use crate::progress::fmt_duration;
+use crate::review;
 use crate::sources::{mpv_events, watch_later, zathura};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -21,6 +22,7 @@ pub struct Report {
     pub completed: Vec<String>,
     /// One line per change, for `patrak sync -v`.
     pub changes: Vec<String>,
+    pub new_cards: usize,
 }
 
 pub fn sync(conn: &mut Connection, cfg: &Config, paths: &Paths) -> Result<Report> {
@@ -160,6 +162,25 @@ pub fn sync(conn: &mut Connection, cfg: &Config, paths: &Paths) -> Result<Report
                 report.completed.push(item.title.clone());
             }
         }
+    }
+
+    // Review cards in the notes of every course and book.
+    let note_dirs: HashSet<PathBuf> = items
+        .values()
+        .filter(|i| !i.missing)
+        .map(|i| i.course_dir.join(library::NOTES_DIR))
+        .collect();
+    let notes: Vec<PathBuf> = note_dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|entries| entries.flatten().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .collect();
+    report.new_cards = review::sync_cards(&tx, &notes, cfg.today())?;
+    if report.new_cards > 0 {
+        report
+            .changes
+            .push(format!("cards    {} new", report.new_cards));
     }
 
     tx.commit()?;

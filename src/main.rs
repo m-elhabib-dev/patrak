@@ -39,6 +39,25 @@ enum Cmd {
     Done { query: String },
     /// Mark a lecture or book as not done and rewind it
     Reset { query: String },
+    /// Set a course's deadline: 2026-11-15, +3w, +10d, +2m, or "clear"
+    Deadline { course: String, when: String },
+    /// Download a YouTube playlist (or one video) as a course with yt-dlp
+    Add {
+        url: String,
+        /// Course folder name (default: the playlist title)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Download new episodes of courses added with `patrak add`
+    Update {
+        /// Only courses whose name contains this
+        query: Option<String>,
+        /// List new episodes without downloading
+        #[arg(long)]
+        check: bool,
+    },
+    /// Review the cards due today (Q:/A: lines in your notes)
+    Review,
     /// Heatmap, streaks and weekly totals
     Stats,
     /// Rescan the library and pull progress from mpv and zathura
@@ -68,6 +87,10 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Note { query }) => cli::note(query),
         Some(Cmd::Done { query }) => cli::mark(query, true),
         Some(Cmd::Reset { query }) => cli::mark(query, false),
+        Some(Cmd::Deadline { course, when }) => cli::deadline(course, when),
+        Some(Cmd::Add { url, name }) => cli::add(url, name),
+        Some(Cmd::Update { query, check }) => cli::update(query, check),
+        Some(Cmd::Review) => cli::review(),
         Some(Cmd::Stats) => cli::stats(),
         Some(Cmd::Sync { verbose }) => cli::sync(verbose),
         Some(Cmd::Remind) => cli::remind(),

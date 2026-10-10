@@ -1,12 +1,14 @@
 use crate::config::{Config, days_back};
 use crate::db::{self, Item, Kind};
+use crate::download::Source;
+use crate::review;
 use anyhow::Result;
 use chrono::{Datelike, Duration, NaiveDate};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Days of history used to estimate a course's finishing date.
+/// Days of history used to estimate a course's pace and finishing date.
 const PACE_DAYS: i64 = 14;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,9 +26,94 @@ pub struct Course {
     /// Index into `lectures` of the lecture to watch next.
     pub next: Option<usize>,
     pub eta: Option<NaiveDate>,
+    /// Average seconds watched per day over the last two weeks.
+    pub pace: f64,
+    pub today_secs: f64,
+    pub deadline: Option<NaiveDate>,
+    /// Set for courses downloaded with `patrak add`.
+    pub source: Option<Source>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStatus {
+    OnTrack,
+    Behind,
+    Overdue,
+    Finished,
+}
+
+impl PlanStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            PlanStatus::OnTrack => "on track",
+            PlanStatus::Behind => "behind",
+            PlanStatus::Overdue => "overdue",
+            PlanStatus::Finished => "finished",
+        }
+    }
 }
 
 impl Course {
+    /// Seconds a day needed from today on (counting what was already watched today) to
+    /// finish by the deadline.
+    /// Past the deadline, everything left is due today.
+    pub fn needed_per_day(&self, today: NaiveDate) -> Option<f64> {
+        let days = ((self.deadline? - today).num_days() + 1).max(1);
+        (self.remaining_secs > 0.0).then(|| (self.remaining_secs + self.today_secs) / days as f64)
+    }
+
+    /// Seconds still to watch today to stay on schedule.
+    pub fn left_today(&self, today: NaiveDate) -> f64 {
+        self.needed_per_day(today)
+            .map_or(0.0, |n| (n - self.today_secs).max(0.0))
+    }
+
+    pub fn plan_status(&self, today: NaiveDate) -> Option<PlanStatus> {
+        let deadline = self.deadline?;
+        Some(
+            if self.next.is_none() || (self.total_secs > 0.0 && self.remaining_secs <= 0.0) {
+                PlanStatus::Finished
+            } else if deadline < today {
+                PlanStatus::Overdue
+            } else if self.pace + 1.0 >= self.needed_per_day(today).unwrap_or(0.0) {
+                PlanStatus::OnTrack
+            } else {
+                PlanStatus::Behind
+            },
+        )
+    }
+
+    /// "due Nov 15 · 36 days left · need 25m/day, averaging 12m/day · behind"
+    pub fn plan_summary(&self, today: NaiveDate) -> Option<String> {
+        let deadline = self.deadline?;
+        let status = self.plan_status(today)?;
+        let mut parts = vec![format!("due {}", deadline.format("%b %-d"))];
+        match status {
+            PlanStatus::Finished => {}
+            PlanStatus::Overdue => parts.push(match (today - deadline).num_days() {
+                1 => "1 day late".into(),
+                n => format!("{n} days late"),
+            }),
+            PlanStatus::OnTrack | PlanStatus::Behind => {
+                let days = (deadline - today).num_days() + 1;
+                parts.push(if days == 1 {
+                    "last day".into()
+                } else {
+                    format!("{days} days left")
+                });
+                if let Some(need) = self.needed_per_day(today) {
+                    parts.push(format!(
+                        "need {}/day, averaging {}/day",
+                        fmt_duration(need),
+                        fmt_duration(self.pace)
+                    ));
+                }
+            }
+        }
+        parts.push(status.label().into());
+        Some(parts.join("  ·  "))
+    }
+
     pub fn next_lecture(&self) -> Option<&Item> {
         self.next.map(|i| &self.lectures[i])
     }
@@ -57,6 +144,9 @@ pub struct Snapshot {
     pub courses: Vec<Course>,
     /// Most recently read first.
     pub books: Vec<Item>,
+    pub cards_due: usize,
+    pub cards_total: usize,
+    pub reviewed_today: i64,
 }
 
 impl Snapshot {
@@ -68,9 +158,31 @@ impl Snapshot {
         self.minutes_by_day.get(&day).copied().unwrap_or(0.0)
     }
 
-    /// The course to continue: the most recently active one with lectures left.
+    /// The course to continue: the deadline course needing the most today if any is short of
+    /// today's share, otherwise the most recently active one with lectures left.
     pub fn current_course(&self) -> Option<&Course> {
-        self.courses.iter().find(|c| c.next.is_some())
+        self.plan()
+            .into_iter()
+            .filter(|c| c.next.is_some() && c.left_today(self.today) > 0.0)
+            .max_by(|a, b| {
+                a.left_today(self.today)
+                    .total_cmp(&b.left_today(self.today))
+            })
+            .or_else(|| self.courses.iter().find(|c| c.next.is_some()))
+    }
+
+    /// Courses with a deadline that aren't finished, soonest deadline first.
+    pub fn plan(&self) -> Vec<&Course> {
+        let mut plan: Vec<&Course> = self
+            .courses
+            .iter()
+            .filter(|c| {
+                c.plan_status(self.today)
+                    .is_some_and(|s| s != PlanStatus::Finished)
+            })
+            .collect();
+        plan.sort_by_key(|c| c.deadline);
+        plan
     }
 
     pub fn last_book(&self) -> Option<&Item> {
@@ -158,7 +270,9 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
     let by_id: HashMap<i64, &Item> = items.iter().map(|i| (i.id, i)).collect();
     let mut minutes_by_day = BTreeMap::new();
     let mut today_entries = Vec::new();
-    let mut recent_secs: HashMap<&str, f64> = HashMap::new();
+    // Per course: seconds watched in the pace window and the first day with any.
+    let mut recent_secs: HashMap<&str, (f64, NaiveDate)> = HashMap::new();
+    let mut today_secs: HashMap<&str, f64> = HashMap::new();
     let pace_from = days_back(today, PACE_DAYS - 1);
     for row in &daily {
         let minutes = row.seconds / 60.0 + row.pages as f64 * cfg.minutes_per_page;
@@ -166,10 +280,15 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
         let Some(item) = by_id.get(&row.item_id) else {
             continue;
         };
-        if row.date >= pace_from {
-            *recent_secs.entry(item.course_key.as_str()).or_insert(0.0) += row.seconds;
+        if row.date >= pace_from && row.seconds > 0.0 {
+            let entry = recent_secs
+                .entry(item.course_key.as_str())
+                .or_insert((0.0, row.date));
+            entry.0 += row.seconds;
+            entry.1 = entry.1.min(row.date);
         }
         if row.date == today {
+            *today_secs.entry(item.course_key.as_str()).or_insert(0.0) += row.seconds;
             today_entries.push(TodayEntry {
                 item: (*item).clone(),
                 seconds: row.seconds,
@@ -179,6 +298,16 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
         }
     }
     today_entries.sort_by(|a, b| b.minutes.total_cmp(&a.minutes));
+
+    let mut reviewed_today = 0;
+    for (date, seconds, cards) in review::daily(conn)? {
+        *minutes_by_day.entry(date).or_insert(0.0) += seconds / 60.0;
+        if date == today {
+            reviewed_today = cards;
+        }
+    }
+    let (cards_due, cards_total) = review::counts(conn, today)?;
+    let deadlines = db::deadlines(conn)?;
 
     let mut grouped: BTreeMap<&str, Vec<&Item>> = BTreeMap::new();
     for item in items.iter().filter(|i| i.kind == Kind::Video) {
@@ -192,8 +321,19 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
         .map(|(key, lectures)| {
             let mut lectures: Vec<Item> = lectures.into_iter().cloned().collect();
             lectures.sort_by_key(|l| l.ord);
-            let pace = recent_secs.get(key).copied().unwrap_or(0.0) / PACE_DAYS as f64;
-            course(key, lectures, pace, today)
+            // Averaged from the first day studied in the window, so a course started
+            // yesterday isn't judged by the twelve days before it.
+            let pace = recent_secs.get(key).map_or(0.0, |&(secs, first)| {
+                secs / ((today - first).num_days() + 1) as f64
+            });
+            let mut c = course(key, lectures, pace, today);
+            c.today_secs = today_secs.get(key).copied().unwrap_or(0.0);
+            c.deadline = deadlines.get(key).copied();
+            // Only folder courses can carry a source file.
+            if Path::new(key) == c.dir {
+                c.source = Source::load(&c.dir);
+            }
+            c
         })
         .collect();
     courses.sort_by(|a, b| {
@@ -216,6 +356,9 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
         best_streak,
         courses,
         books,
+        cards_due,
+        cards_total,
+        reviewed_today,
     })
 }
 
@@ -246,6 +389,10 @@ fn course(key: &str, lectures: Vec<Item>, secs_per_day: f64, today: NaiveDate) -
         last_active: lectures.iter().map(touched).max().unwrap_or(0),
         next: next_lecture(&lectures),
         eta,
+        pace: secs_per_day,
+        today_secs: 0.0,
+        deadline: None,
+        source: None,
         lectures,
     }
 }
@@ -331,7 +478,7 @@ pub fn item_status(item: &Item) -> String {
             } else if item.position > 0.0 {
                 format!("▶ {:.0}%", item.fraction().unwrap_or(0.0) * 100.0)
             } else {
-                "·".to_owned()
+                "○".to_owned()
             };
             match item.duration {
                 Some(d) if item.position > 0.0 && !item.is_done() => {
@@ -459,6 +606,39 @@ mod tests {
         assert_eq!(c.remaining_secs, 900.0);
         assert!((c.fraction - 0.5).abs() < 1e-9);
         assert_eq!(c.eta, Some(d("2026-10-14")));
+    }
+
+    #[test]
+    fn deadline_needs_a_daily_share() {
+        let today = d("2026-10-11");
+        let mut c = course(
+            "/c",
+            vec![
+                lecture(0, 5, true),
+                lecture(1, 9, false),
+                lecture(2, 0, false),
+            ],
+            300.0,
+            today,
+        );
+        assert_eq!(c.plan_status(today), None);
+
+        // 900 s left, 300 s watched today, 3 days including today: 400 s a day.
+        c.today_secs = 300.0;
+        c.deadline = Some(d("2026-10-13"));
+        assert_eq!(c.needed_per_day(today), Some(400.0));
+        assert_eq!(c.left_today(today), 100.0);
+        assert_eq!(c.plan_status(today), Some(PlanStatus::Behind));
+        c.pace = 450.0;
+        assert_eq!(c.plan_status(today), Some(PlanStatus::OnTrack));
+        assert_eq!(c.plan_status(d("2026-10-14")), Some(PlanStatus::Overdue));
+        // Overdue: the rest is due today.
+        assert_eq!(c.needed_per_day(d("2026-10-14")), Some(1200.0));
+        assert!(
+            c.plan_summary(today)
+                .unwrap()
+                .starts_with("due Oct 13  ·  3 days left  ·  need 6m/day")
+        );
     }
 
     #[test]

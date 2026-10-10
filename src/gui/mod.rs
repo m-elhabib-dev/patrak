@@ -1,21 +1,30 @@
 mod books;
 mod courses;
+mod download_dialog;
 mod notes;
 mod prefs;
+mod review_dialog;
 mod stats;
 mod today;
 mod widgets;
 
 use adw::prelude::*;
+use chrono::NaiveDate;
 use gtk::{gio, glib};
 use patrak::config::{self, Config, Paths};
 use patrak::progress::Snapshot;
 use patrak::sync::{self, Report};
-use patrak::{Session, db, launch, setup};
+use patrak::{Session, db, download, launch, setup};
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
+
+/// Playlists are checked for new episodes when the last check is older than this.
+const SOURCE_CHECK_EVERY: i64 = 20 * 3600;
+/// After a failed check (offline, say), wait this long before trying again.
+const SOURCE_RETRY_AFTER: i64 = 3600;
 
 /// Something a page asks the app to do.
 pub enum Action {
@@ -30,8 +39,20 @@ pub enum Action {
         secs: f64,
     },
     Read(i64),
+    /// Open a book at a page (used for `[p. 42]` stamps in notes).
+    ReadAt {
+        item_id: i64,
+        page: i64,
+    },
     Note(i64),
     SetDone(i64, bool),
+    SetDeadline(String, Option<NaiveDate>),
+    Review,
+    /// Look for new episodes of a downloaded course.
+    CheckCourse(PathBuf),
+    /// Download new episodes of a downloaded course.
+    UpdateCourse(PathBuf),
+    OpenUrl(String),
 }
 
 pub type Act = Rc<dyn Fn(Action)>;
@@ -91,6 +112,8 @@ struct App {
     sync_again: Cell<bool>,
     refresh_scheduled: Cell<bool>,
     monitors: RefCell<Vec<gio::FileMonitor>>,
+    checking_sources: Cell<bool>,
+    last_source_check: Cell<i64>,
 }
 
 impl App {
@@ -152,9 +175,15 @@ impl App {
                 .tooltip_text("Rescan library (Ctrl+R)")
                 .action_name("app.refresh")
                 .build();
+            let add = gtk::Button::builder()
+                .icon_name("list-add-symbolic")
+                .tooltip_text("Add a course from YouTube (Ctrl+N)")
+                .action_name("app.add-course")
+                .build();
 
             let header = adw::HeaderBar::new();
             header.set_title_widget(Some(&switcher));
+            header.pack_start(&add);
             header.pack_start(&refresh);
             header.pack_end(&menu_button);
 
@@ -206,6 +235,8 @@ impl App {
                 sync_again: Cell::new(false),
                 refresh_scheduled: Cell::new(false),
                 monitors: RefCell::new(Vec::new()),
+                checking_sources: Cell::new(false),
+                last_source_check: Cell::new(0),
             }
         });
 
@@ -266,6 +297,7 @@ impl App {
         add("refresh", &["<Control>r", "F5"], |app| app.refresh());
         add("preferences", &["<Control>comma"], prefs::show);
         add("about", &[], |app| app.show_about());
+        add("add-course", &["<Control>n"], download_dialog::show_add);
         add("quit", &["<Control>q"], |app| app.window.close());
     }
 
@@ -281,11 +313,12 @@ impl App {
             }
             Action::PlayAt { item_id, secs } => {
                 if let Some(item) = snap.item(item_id) {
-                    self.spawn(vec![
-                        "mpv".into(),
-                        format!("--start={secs}").into(),
-                        item.path.clone().into(),
-                    ]);
+                    self.spawn(launch::play_at_args(item, secs));
+                }
+            }
+            Action::ReadAt { item_id, page } => {
+                if let Some(book) = snap.item(item_id) {
+                    self.spawn(launch::read_at_args(book, page));
                 }
             }
             Action::Read(id) => {
@@ -305,6 +338,24 @@ impl App {
                     Ok(()) => self.refresh(),
                     Err(e) => self.toast(&format!("Couldn't update: {e:#}")),
                 }
+            }
+            Action::SetDeadline(key, date) => {
+                let result =
+                    db::open(&self.paths.db()).and_then(|conn| db::set_deadline(&conn, &key, date));
+                match result {
+                    Ok(()) => self.refresh(),
+                    Err(e) => self.toast(&format!("Couldn't save the deadline: {e:#}")),
+                }
+            }
+            Action::Review => review_dialog::show(self),
+            Action::CheckCourse(dir) => self.check_sources(vec![dir], true),
+            Action::UpdateCourse(dir) => download_dialog::show_update(self, dir),
+            Action::OpenUrl(url) => {
+                gtk::UriLauncher::new(&url).launch(
+                    Some(&self.window),
+                    gio::Cancellable::NONE,
+                    |_| {},
+                );
             }
         }
     }
@@ -386,7 +437,71 @@ impl App {
         self.courses.update(&snap);
         self.books.update(&snap);
         self.stats.update(&snap);
-        *self.snapshot.borrow_mut() = Some(snap);
+        *self.snapshot.borrow_mut() = Some(snap.clone());
+        self.check_stale_sources(&snap);
+    }
+
+    /// Checks downloaded courses for new episodes about once a day, in the background.
+    fn check_stale_sources(self: &Rc<Self>, snap: &Snapshot) {
+        let now = config::now();
+        if now - self.last_source_check.get() < SOURCE_RETRY_AFTER {
+            return;
+        }
+        let stale: Vec<PathBuf> = snap
+            .courses
+            .iter()
+            .filter(|c| {
+                c.source
+                    .as_ref()
+                    .is_some_and(|s| now - s.checked_at.unwrap_or(0) > SOURCE_CHECK_EVERY)
+            })
+            .map(|c| c.dir.clone())
+            .collect();
+        if !stale.is_empty() {
+            self.check_sources(stale, false);
+        }
+    }
+
+    /// Asks yt-dlp which episodes are new. `report` toasts the result even when nothing is new.
+    fn check_sources(self: &Rc<Self>, dirs: Vec<PathBuf>, report: bool) {
+        if self.checking_sources.replace(true) {
+            return;
+        }
+        self.last_source_check.set(config::now());
+        if report {
+            self.toast("Checking for new episodes…");
+        }
+        let cfg = self.cfg.borrow().clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let results = gio::spawn_blocking(move || {
+                dirs.into_iter()
+                    .map(|dir| {
+                        let name = dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        (name, download::check(&cfg, &dir))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let Some(app) = weak.upgrade() else { return };
+            app.checking_sources.set(false);
+            for (name, result) in results {
+                let name = widgets::isolate(&name);
+                match result {
+                    Ok(new) if !new.is_empty() => {
+                        app.toast(&format!("{} new episodes in {name}", new.len()))
+                    }
+                    Ok(_) if report => app.toast(&format!("{name} is up to date")),
+                    Err(e) if report => app.toast(&format!("Couldn't check {name}: {e:#}")),
+                    _ => {}
+                }
+            }
+            app.refresh();
+        });
     }
 
     /// Live updates: the mpv script writes its log every minute of playback, zathura writes on close.

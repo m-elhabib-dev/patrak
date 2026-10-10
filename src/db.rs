@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +110,33 @@ CREATE TABLE meta (
 );
 ";
 
+/// Version 2: course deadlines and review cards.
+const SCHEMA_V2: &str = "
+CREATE TABLE course_plans (
+    course_key TEXT PRIMARY KEY,
+    deadline   TEXT NOT NULL
+);
+CREATE TABLE cards (
+    id          INTEGER PRIMARY KEY,
+    note        TEXT    NOT NULL,
+    question    TEXT    NOT NULL,
+    answer      TEXT    NOT NULL,
+    due         TEXT    NOT NULL,
+    interval    REAL    NOT NULL DEFAULT 0,
+    ease        REAL    NOT NULL DEFAULT 2.5,
+    reps        INTEGER NOT NULL DEFAULT 0,
+    lapses      INTEGER NOT NULL DEFAULT 0,
+    last_review INTEGER,
+    missing     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (note, question)
+);
+CREATE TABLE review_daily (
+    date    TEXT PRIMARY KEY,
+    seconds REAL    NOT NULL DEFAULT 0,
+    cards   INTEGER NOT NULL DEFAULT 0
+);
+";
+
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -132,6 +160,11 @@ fn init(conn: &Connection) -> Result<()> {
     if version < 1 {
         conn.execute_batch(SCHEMA)?;
         conn.pragma_update(None, "user_version", 1)?;
+    }
+    if version < 2 {
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"
+        ))?;
     }
     Ok(())
 }
@@ -338,5 +371,37 @@ pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
         "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
         params![key, value],
     )?;
+    Ok(())
+}
+
+pub fn deadlines(conn: &Connection) -> Result<HashMap<String, NaiveDate>> {
+    let mut stmt = conn.prepare("SELECT course_key, deadline FROM course_plans")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (key, date) = row?;
+        if let Ok(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
+            out.insert(key, date);
+        }
+    }
+    Ok(out)
+}
+
+pub fn set_deadline(
+    conn: &Connection,
+    course_key: &str,
+    deadline: Option<NaiveDate>,
+) -> Result<()> {
+    match deadline {
+        Some(d) => conn.execute(
+            "INSERT INTO course_plans (course_key, deadline) VALUES (?1, ?2)
+             ON CONFLICT (course_key) DO UPDATE SET deadline = ?2",
+            params![course_key, d.to_string()],
+        )?,
+        None => conn.execute(
+            "DELETE FROM course_plans WHERE course_key = ?1",
+            [course_key],
+        )?,
+    };
     Ok(())
 }
