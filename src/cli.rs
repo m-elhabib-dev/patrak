@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{Datelike, Duration, NaiveDate};
 use patrak::Session;
 use patrak::db::{self, Item, Kind};
-use patrak::progress::{Course, Snapshot, fmt_clock, fmt_duration, item_status};
+use patrak::progress::{Course, Day, Snapshot, fmt_clock, fmt_duration, item_status};
 use patrak::review::{self, Card, Grade};
 use patrak::{config::Config, download, launch, setup, sync::set_done};
 use std::collections::VecDeque;
@@ -63,14 +63,23 @@ pub fn today() -> Result<()> {
     Ok(())
 }
 
+/// "████░░ 32 / 45 min", or just "32 min" when the goal is off.
+fn goal_part(done: f64, goal: f64, unit: &str) -> String {
+    let done_text = bold(&format!("{done:.0}"));
+    if goal > 0.0 {
+        format!("{} {done_text} / {goal:.0} {unit}", bar(done / goal, 12))
+    } else {
+        format!("{done_text} {unit}")
+    }
+}
+
 fn print_today(snap: &Snapshot) {
-    let mins = snap.today_minutes();
+    let studied = snap.studied_today();
     println!(
-        "{}  {}  {} / {} min   streak {} (best {})",
+        "{}  {}   {}   streak {} (best {})",
         bold(&snap.today.format("%a %d %b").to_string()),
-        bar(mins / snap.goal, 24),
-        bold(&format!("{mins:.0}")),
-        snap.goal,
+        goal_part(studied.minutes, snap.goals.minutes, "min"),
+        goal_part(studied.pages as f64, snap.goals.pages, "pages"),
         bold(&snap.streak.to_string()),
         snap.best_streak,
     );
@@ -338,27 +347,38 @@ pub fn stats() -> Result<()> {
     }
     println!(
         "  {}",
-        dim("less ■ ■ ■ ■ ■ more   (full square = daily goal met)")
+        dim("less ■ ■ ■ ■ ■ more   (full square = daily goals met)")
     );
 
-    println!("\n{}", bold("Weekly minutes"));
-    let weeks = snap.weekly_minutes(8);
-    let max = weeks.iter().map(|w| w.1).fold(snap.goal * 7.0, f64::max);
-    for (monday, mins) in weeks {
+    println!("\n{}", bold("Weekly totals"));
+    let weeks = snap.weekly(8);
+    let max = weeks
+        .iter()
+        .map(|w| w.1.minutes)
+        .fold(snap.goals.minutes * 7.0, f64::max)
+        .max(1.0);
+    for (monday, week) in weeks {
+        let pages = if week.pages > 0 {
+            dim(&format!("  {} pages", week.pages))
+        } else {
+            String::new()
+        };
         println!(
-            "  {}  {} {mins:>5.0}",
+            "  {}  {} {:>5.0} min{pages}",
             monday.format("%b %d"),
-            bar(mins / max, 30)
+            bar(week.minutes / max, 30),
+            week.minutes
         );
     }
 
-    let total: f64 = snap.minutes_by_day.values().sum();
-    let days = snap.minutes_by_day.values().filter(|&&m| m > 0.0).count();
+    let total: Day = snap.days.values().copied().sum();
+    let days = snap.days.values().filter(|d| !d.is_empty()).count();
     println!(
-        "\nstreak {}  ·  best {}  ·  {} studied over {days} days",
+        "\nstreak {}  ·  best {}  ·  {} studied, {} pages read over {days} days",
         bold(&snap.streak.to_string()),
         snap.best_streak,
-        fmt_duration(total * 60.0)
+        fmt_duration(total.minutes * 60.0),
+        total.pages
     );
     Ok(())
 }
@@ -381,11 +401,25 @@ pub fn sync(verbose: bool) -> Result<()> {
 
 pub fn remind() -> Result<()> {
     let (_, snap) = session()?;
-    let mins = snap.today_minutes();
-    if mins >= snap.goal {
+    let (studied, goals) = (snap.studied_today(), snap.goals);
+    if goals.met(studied) {
         return Ok(());
     }
-    let mut body = format!("{mins:.0} of {} minutes so far.", snap.goal);
+    let mut short = Vec::new();
+    if studied.minutes < goals.minutes {
+        short.push(format!(
+            "{:.0} of {:.0} minutes",
+            studied.minutes, goals.minutes
+        ));
+    }
+    if (studied.pages as f64) < goals.pages {
+        short.push(format!("{} of {:.0} pages", studied.pages, goals.pages));
+    }
+    let mut body = if short.is_empty() {
+        "Nothing studied yet today.".to_owned()
+    } else {
+        format!("{} so far.", short.join(" and "))
+    };
     if let Some(l) = snap.current_course().and_then(Course::next_lecture) {
         body.push_str(&format!("\nNext: {}", l.title));
     }

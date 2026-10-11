@@ -131,9 +131,8 @@ fn first_sync_records_a_baseline_then_counts_new_progress() {
     assert_eq!(report.new_items, 4);
     assert!(report.completed.is_empty());
     let snap = fx.snapshot();
-    assert_eq!(
-        snap.today_minutes(),
-        0.0,
+    assert!(
+        snap.studied_today().is_empty(),
         "existing progress is a baseline, not today's work"
     );
     let course = &snap.courses[0];
@@ -151,8 +150,9 @@ fn first_sync_records_a_baseline_then_counts_new_progress() {
     let report = fx.sync();
     assert_eq!(report.completed, ["01 Intro"]);
     let snap = fx.snapshot();
-    // 600 s of video + 20 pages × 2 min.
-    assert_eq!(snap.today_minutes(), 10.0 + 40.0);
+    // 600 s of video and 20 pages.
+    assert_eq!(snap.studied_today().minutes, 10.0);
+    assert_eq!(snap.studied_today().pages, 20);
     let course = &snap.courses[0];
     assert!(course.lectures[0].is_done());
     assert_eq!(course.lectures[0].duration, Some(600.0));
@@ -161,7 +161,8 @@ fn first_sync_records_a_baseline_then_counts_new_progress() {
 
     // The same log lines are not counted twice.
     fx.sync();
-    assert_eq!(fx.snapshot().today_minutes(), 50.0);
+    let today = fx.snapshot().studied_today();
+    assert_eq!((today.minutes, today.pages), (10.0, 20));
 
     // Clearing "done" sticks even though the saved position is at the end.
     let id = course.lectures[0].id;
@@ -178,13 +179,13 @@ fn without_the_script_watch_later_moves_count_as_watch_time() {
 
     fx.resume(&video, 300.0, SystemTime::now());
     fx.sync();
-    assert_eq!(fx.snapshot().today_minutes(), 5.0);
+    assert_eq!(fx.snapshot().studied_today().minutes, 5.0);
 
     // Moving backwards (rewatching) updates the position without adding time.
     fx.resume(&video, 60.0, SystemTime::now() + Duration::from_secs(5));
     fx.sync();
     let snap = fx.snapshot();
-    assert_eq!(snap.today_minutes(), 5.0);
+    assert_eq!(snap.studied_today().minutes, 5.0);
     assert_eq!(snap.courses[0].lectures[2].position, 60.0);
 }
 

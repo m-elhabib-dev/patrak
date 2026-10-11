@@ -13,9 +13,10 @@ pub struct Config {
     pub video_dirs: Vec<String>,
     /// Every pdf/epub/djvu below these directories is a book.
     pub book_dirs: Vec<String>,
+    /// Minutes of lectures watched (and cards reviewed) a day; 0 turns this goal off.
     pub daily_goal_minutes: u32,
-    /// Converts pages read into learning minutes for the daily goal.
-    pub minutes_per_page: f64,
+    /// Book pages read a day; 0 turns this goal off.
+    pub daily_goal_pages: u32,
     /// A lecture counts as done once position/duration reaches this ratio.
     pub complete_threshold: f64,
     /// Study before this time counts for the previous day.
@@ -36,7 +37,7 @@ impl Default for Config {
             video_dirs: vec!["~/patrak/Videos".into()],
             book_dirs: vec!["~/patrak/Books".into()],
             daily_goal_minutes: 60,
-            minutes_per_page: 2.0,
+            daily_goal_pages: 20,
             complete_threshold: 0.95,
             day_starts_at: "04:00".into(),
             reminder_time: "21:00".into(),
@@ -92,10 +93,6 @@ impl Config {
 
     pub fn today(&self) -> NaiveDate {
         self.day_of(Local::now().timestamp())
-    }
-
-    pub fn goal(&self) -> f64 {
-        f64::from(self.daily_goal_minutes.max(1))
     }
 }
 
@@ -193,6 +190,14 @@ mod tests {
     fn partial_config_uses_defaults() {
         let cfg: Config = toml::from_str("daily_goal_minutes = 90").unwrap();
         assert_eq!(cfg.daily_goal_minutes, 90);
+        assert_eq!(cfg.daily_goal_pages, 20);
         assert_eq!(cfg.day_starts_at, "04:00");
+    }
+
+    #[test]
+    fn old_config_with_minutes_per_page_still_loads() {
+        let cfg: Config =
+            toml::from_str("daily_goal_minutes = 45\nminutes_per_page = 2.0").unwrap();
+        assert_eq!(cfg.daily_goal_minutes, 45);
     }
 }

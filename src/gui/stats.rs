@@ -1,7 +1,7 @@
 use super::widgets::{label, page, progress, value_label};
 use adw::prelude::*;
 use chrono::{Datelike, Duration};
-use patrak::progress::{Snapshot, fmt_duration};
+use patrak::progress::{Day, Snapshot, fmt_duration};
 
 const WEEKS: i64 = 26;
 
@@ -56,7 +56,7 @@ impl StatsPage {
             .build();
         heat_box.append(&heat_scroller);
         heat_box.append(&label(
-            "Brighter is more time; green means the daily goal was met.",
+            "Brighter is closer to the daily goals; green means they were all met.",
             &["dim-label", "caption"],
         ));
         content.append(&heat_box);
@@ -66,7 +66,7 @@ impl StatsPage {
             .column_spacing(12)
             .build();
         let weeks_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        weeks_box.append(&label("Minutes per week", &["heading"]));
+        weeks_box.append(&label("Per week", &["heading"]));
         weeks_box.append(&weeks);
         content.append(&weeks_box);
 
@@ -84,12 +84,11 @@ impl StatsPage {
     pub fn update(&self, snap: &Snapshot) {
         self.streak.set_label(&snap.streak.to_string());
         self.best.set_label(&snap.best_streak.to_string());
-        let weekly = snap.weekly_minutes(12);
-        let this_week = weekly.last().map_or(0.0, |w| w.1);
+        let weekly = snap.weekly(12);
+        let this_week = weekly.last().map_or(0.0, |w| w.1.minutes);
         self.this_week.set_label(&fmt_duration(this_week * 60.0));
-        self.total.set_label(&fmt_duration(
-            snap.minutes_by_day.values().sum::<f64>() * 60.0,
-        ));
+        let total: Day = snap.days.values().copied().sum();
+        self.total.set_label(&fmt_duration(total.minutes * 60.0));
 
         clear_grid(&self.heat);
         let start = snap.today
@@ -123,10 +122,12 @@ impl StatsPage {
                 cell.add_css_class("heat");
                 if date <= snap.today {
                     cell.add_css_class(&format!("heat-{}", snap.heat_level(date)));
+                    let studied = snap.studied_on(date);
                     cell.set_tooltip_text(Some(&format!(
-                        "{}  ·  {:.0} min",
+                        "{}  ·  {:.0} min  ·  {} pages",
                         date.format("%a %-d %b"),
-                        snap.minutes_on(date)
+                        studied.minutes,
+                        studied.pages
                     )));
                 }
                 self.heat
@@ -135,8 +136,12 @@ impl StatsPage {
         }
 
         clear_grid(&self.weeks);
-        let max = weekly.iter().map(|w| w.1).fold(snap.goal * 7.0, f64::max);
-        for (i, (monday, minutes)) in weekly.iter().enumerate() {
+        let max = weekly
+            .iter()
+            .map(|w| w.1.minutes)
+            .fold(snap.goals.minutes * 7.0, f64::max)
+            .max(1.0);
+        for (i, (monday, week)) in weekly.iter().enumerate() {
             let row = i as i32;
             self.weeks.attach(
                 &label(
@@ -148,13 +153,20 @@ impl StatsPage {
                 1,
                 1,
             );
-            let bar = progress(minutes / max, -1);
+            let bar = progress(week.minutes / max, -1);
             bar.set_hexpand(true);
             self.weeks.attach(&bar, 1, row, 1, 1);
-            let value = value_label(&format!("{minutes:.0} min"), &["numeric"]);
+            let value = value_label(&format!("{:.0} min", week.minutes), &["numeric"]);
             value.set_xalign(1.0);
             value.set_width_chars(8);
             self.weeks.attach(&value, 2, row, 1, 1);
+            if week.pages > 0 {
+                let pages =
+                    value_label(&format!("{} pages", week.pages), &["numeric", "dim-label"]);
+                pages.set_xalign(1.0);
+                pages.set_width_chars(10);
+                self.weeks.attach(&pages, 3, row, 1, 1);
+            }
         }
     }
 }

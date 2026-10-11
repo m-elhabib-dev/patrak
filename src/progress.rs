@@ -128,15 +128,71 @@ pub struct TodayEntry {
     pub item: Item,
     pub seconds: f64,
     pub pages: i64,
+}
+
+/// What was studied on one day.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Day {
+    /// Lectures watched plus cards reviewed.
     pub minutes: f64,
+    pub pages: i64,
+}
+
+impl Day {
+    pub fn is_empty(&self) -> bool {
+        self.minutes <= 0.0 && self.pages <= 0
+    }
+}
+
+impl std::ops::AddAssign for Day {
+    fn add_assign(&mut self, other: Day) {
+        self.minutes += other.minutes;
+        self.pages += other.pages;
+    }
+}
+
+impl std::iter::Sum for Day {
+    fn sum<I: Iterator<Item = Day>>(iter: I) -> Day {
+        let mut total = Day::default();
+        for day in iter {
+            total += day;
+        }
+        total
+    }
+}
+
+/// Daily goals; 0 turns a goal off.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Goals {
+    pub minutes: f64,
+    pub pages: f64,
+}
+
+impl Goals {
+    /// 0 to 1: the average share of each goal that's on, each share capped at 1.
+    /// With no goal on, any study counts as 1.
+    pub fn progress(&self, day: Day) -> f64 {
+        let shares: Vec<f64> = [(day.minutes, self.minutes), (day.pages as f64, self.pages)]
+            .into_iter()
+            .filter(|&(_, goal)| goal > 0.0)
+            .map(|(done, goal)| (done / goal).clamp(0.0, 1.0))
+            .collect();
+        if shares.is_empty() {
+            return if day.is_empty() { 0.0 } else { 1.0 };
+        }
+        shares.iter().sum::<f64>() / shares.len() as f64
+    }
+
+    pub fn met(&self, day: Day) -> bool {
+        self.progress(day) >= 1.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub today: NaiveDate,
-    pub goal: f64,
-    pub minutes_per_page: f64,
-    pub minutes_by_day: BTreeMap<NaiveDate, f64>,
+    pub goals: Goals,
+    pub days: BTreeMap<NaiveDate, Day>,
     pub today_entries: Vec<TodayEntry>,
     pub streak: usize,
     pub best_streak: usize,
@@ -150,12 +206,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn today_minutes(&self) -> f64 {
-        self.minutes_on(self.today)
+    pub fn studied_today(&self) -> Day {
+        self.studied_on(self.today)
     }
 
-    pub fn minutes_on(&self, day: NaiveDate) -> f64 {
-        self.minutes_by_day.get(&day).copied().unwrap_or(0.0)
+    pub fn studied_on(&self, day: NaiveDate) -> Day {
+        self.days.get(&day).copied().unwrap_or_default()
     }
 
     /// The course to continue: the deadline course needing the most today if any is short of
@@ -225,8 +281,8 @@ impl Snapshot {
             .collect()
     }
 
-    /// Minutes per week for the last `weeks` weeks (Monday first), oldest first.
-    pub fn weekly_minutes(&self, weeks: usize) -> Vec<(NaiveDate, f64)> {
+    /// Totals per week for the last `weeks` weeks (Monday first), oldest first.
+    pub fn weekly(&self, weeks: usize) -> Vec<(NaiveDate, Day)> {
         let this_monday =
             self.today - Duration::days(self.today.weekday().num_days_from_monday() as i64);
         (0..weeks as i64)
@@ -234,18 +290,20 @@ impl Snapshot {
             .map(|w| {
                 let start = this_monday - Duration::weeks(w);
                 let total = (0..7)
-                    .map(|d| self.minutes_on(start + Duration::days(d)))
+                    .map(|d| self.studied_on(start + Duration::days(d)))
                     .sum();
                 (start, total)
             })
             .collect()
     }
 
-    /// 0 for nothing, up to 4 for reaching the goal; used for heatmap colours.
+    /// 0 for nothing, up to 4 for reaching every goal; used for heatmap colours.
     pub fn heat_level(&self, day: NaiveDate) -> u8 {
-        let ratio = self.minutes_on(day) / self.goal;
-        match ratio {
-            r if r <= 0.0 => 0,
+        let studied = self.studied_on(day);
+        if studied.is_empty() {
+            return 0;
+        }
+        match self.goals.progress(studied) {
             r if r < 1.0 / 3.0 => 1,
             r if r < 2.0 / 3.0 => 2,
             r if r < 1.0 => 3,
@@ -260,7 +318,10 @@ fn matches(text: &str, query: &str) -> bool {
 
 pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
     let today = cfg.today();
-    let goal = cfg.goal();
+    let goals = Goals {
+        minutes: f64::from(cfg.daily_goal_minutes),
+        pages: f64::from(cfg.daily_goal_pages),
+    };
     let items: Vec<Item> = db::items(conn)?
         .into_iter()
         .filter(|i| !i.missing)
@@ -268,15 +329,17 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
     let daily = db::daily(conn)?;
 
     let by_id: HashMap<i64, &Item> = items.iter().map(|i| (i.id, i)).collect();
-    let mut minutes_by_day = BTreeMap::new();
+    let mut days: BTreeMap<NaiveDate, Day> = BTreeMap::new();
     let mut today_entries = Vec::new();
     // Per course: seconds watched in the pace window and the first day with any.
     let mut recent_secs: HashMap<&str, (f64, NaiveDate)> = HashMap::new();
     let mut today_secs: HashMap<&str, f64> = HashMap::new();
     let pace_from = days_back(today, PACE_DAYS - 1);
     for row in &daily {
-        let minutes = row.seconds / 60.0 + row.pages as f64 * cfg.minutes_per_page;
-        *minutes_by_day.entry(row.date).or_insert(0.0) += minutes;
+        *days.entry(row.date).or_default() += Day {
+            minutes: row.seconds / 60.0,
+            pages: row.pages,
+        };
         let Some(item) = by_id.get(&row.item_id) else {
             continue;
         };
@@ -293,15 +356,20 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
                 item: (*item).clone(),
                 seconds: row.seconds,
                 pages: row.pages,
-                minutes,
             });
         }
     }
-    today_entries.sort_by(|a, b| b.minutes.total_cmp(&a.minutes));
+    // Lectures first, longest first; then books, most pages first.
+    today_entries.sort_by(|a, b| {
+        (a.item.kind == Kind::Book)
+            .cmp(&(b.item.kind == Kind::Book))
+            .then(b.seconds.total_cmp(&a.seconds))
+            .then(b.pages.cmp(&a.pages))
+    });
 
     let mut reviewed_today = 0;
     for (date, seconds, cards) in review::daily(conn)? {
-        *minutes_by_day.entry(date).or_insert(0.0) += seconds / 60.0;
+        days.entry(date).or_default().minutes += seconds / 60.0;
         if date == today {
             reviewed_today = cards;
         }
@@ -345,12 +413,11 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
     let mut books: Vec<Item> = items.into_iter().filter(|i| i.kind == Kind::Book).collect();
     books.sort_by(|a, b| touched(b).cmp(&touched(a)).then(a.ord.cmp(&b.ord)));
 
-    let (streak, best_streak) = streaks(&minutes_by_day, goal, today);
+    let (streak, best_streak) = streaks(&days, goals, today);
     Ok(Snapshot {
         today,
-        goal,
-        minutes_per_page: cfg.minutes_per_page,
-        minutes_by_day,
+        goals,
+        days,
         today_entries,
         streak,
         best_streak,
@@ -414,10 +481,10 @@ fn next_lecture(lectures: &[Item]) -> Option<usize> {
         .or_else(|| lectures.iter().position(|l| !l.is_done()))
 }
 
-/// (current, best). Today only counts toward the current streak once the goal is met,
+/// (current, best). Today only counts toward the current streak once the goals are met,
 /// so an unfinished today doesn't break a streak that ran through yesterday.
-pub fn streaks(minutes: &BTreeMap<NaiveDate, f64>, goal: f64, today: NaiveDate) -> (usize, usize) {
-    let met = |d: NaiveDate| minutes.get(&d).is_some_and(|&m| m >= goal);
+pub fn streaks(days: &BTreeMap<NaiveDate, Day>, goals: Goals, today: NaiveDate) -> (usize, usize) {
+    let met = |d: NaiveDate| days.get(&d).is_some_and(|&s| goals.met(s));
     let mut day = if met(today) {
         today
     } else {
@@ -432,8 +499,8 @@ pub fn streaks(minutes: &BTreeMap<NaiveDate, f64>, goal: f64, today: NaiveDate) 
     let mut best = 0;
     let mut run = 0;
     let mut prev: Option<NaiveDate> = None;
-    for (&d, &m) in minutes {
-        if m < goal {
+    for (&d, &s) in days {
+        if !goals.met(s) {
             continue;
         }
         run = if prev == Some(d - Duration::days(1)) {
@@ -510,6 +577,15 @@ mod tests {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
     }
 
+    fn studied(minutes: f64, pages: i64) -> Day {
+        Day { minutes, pages }
+    }
+
+    const MINUTES_ONLY: Goals = Goals {
+        minutes: 60.0,
+        pages: 0.0,
+    };
+
     #[test]
     fn streak_survives_an_unfinished_today() {
         let mut m = BTreeMap::new();
@@ -521,12 +597,53 @@ mod tests {
             ("2026-10-09", 65.0),
             ("2026-10-10", 90.0),
         ] {
-            m.insert(d(day), mins);
+            m.insert(d(day), studied(mins, 0));
         }
-        assert_eq!(streaks(&m, 60.0, d("2026-10-11")), (3, 3));
-        m.insert(d("2026-10-11"), 61.0);
-        assert_eq!(streaks(&m, 60.0, d("2026-10-11")), (4, 4));
-        assert_eq!(streaks(&m, 60.0, d("2026-10-13")), (0, 4));
+        assert_eq!(streaks(&m, MINUTES_ONLY, d("2026-10-11")), (3, 3));
+        m.insert(d("2026-10-11"), studied(61.0, 0));
+        assert_eq!(streaks(&m, MINUTES_ONLY, d("2026-10-11")), (4, 4));
+        assert_eq!(streaks(&m, MINUTES_ONLY, d("2026-10-13")), (0, 4));
+    }
+
+    #[test]
+    fn streak_needs_every_goal_that_is_on() {
+        let both = Goals {
+            minutes: 60.0,
+            pages: 20.0,
+        };
+        let mut m = BTreeMap::new();
+        m.insert(d("2026-10-09"), studied(60.0, 25));
+        m.insert(d("2026-10-10"), studied(90.0, 5));
+        assert_eq!(streaks(&m, both, d("2026-10-11")), (0, 1));
+        assert_eq!(streaks(&m, MINUTES_ONLY, d("2026-10-11")), (2, 2));
+    }
+
+    #[test]
+    fn goal_progress_averages_capped_shares() {
+        let both = Goals {
+            minutes: 60.0,
+            pages: 20.0,
+        };
+        // Twice the minutes can't make up for no pages.
+        assert_eq!(both.progress(studied(120.0, 0)), 0.5);
+        assert_eq!(both.progress(studied(30.0, 10)), 0.5);
+        assert!(both.met(studied(60.0, 20)));
+        assert!(!both.met(studied(600.0, 19)));
+
+        let pages_only = Goals {
+            minutes: 0.0,
+            pages: 20.0,
+        };
+        assert!(pages_only.met(studied(0.0, 20)));
+        assert_eq!(pages_only.progress(studied(90.0, 5)), 0.25);
+
+        // No goal: any study counts.
+        let none = Goals {
+            minutes: 0.0,
+            pages: 0.0,
+        };
+        assert!(!none.met(Day::default()));
+        assert!(none.met(studied(0.0, 1)));
     }
 
     fn lecture(ord: i64, position_ts: i64, done: bool) -> Item {

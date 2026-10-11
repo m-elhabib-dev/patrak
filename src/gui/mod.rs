@@ -47,6 +47,11 @@ pub enum Action {
     Note(i64),
     SetDone(i64, bool),
     SetDeadline(String, Option<NaiveDate>),
+    /// Daily goals in minutes and pages; 0 turns one off.
+    SetGoals {
+        minutes: u32,
+        pages: u32,
+    },
     Review,
     /// Look for new episodes of a downloaded course.
     CheckCourse(PathBuf),
@@ -217,6 +222,11 @@ impl App {
             narrow.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
             narrow.add_setter(&switcher, "visible", Some(&false.to_value()));
             narrow.add_setter(&courses.root, "collapsed", Some(&true.to_value()));
+            narrow.add_setter(
+                &today.meters,
+                "orientation",
+                Some(&gtk::Orientation::Vertical.to_value()),
+            );
             window.add_breakpoint(narrow);
 
             App {
@@ -345,6 +355,20 @@ impl App {
                 match result {
                     Ok(()) => self.refresh(),
                     Err(e) => self.toast(&format!("Couldn't save the deadline: {e:#}")),
+                }
+            }
+            Action::SetGoals { minutes, pages } => {
+                let cfg = Config {
+                    daily_goal_minutes: minutes,
+                    daily_goal_pages: pages,
+                    ..self.cfg.borrow().clone()
+                };
+                if cfg == *self.cfg.borrow() {
+                    return;
+                }
+                match cfg.save(&self.paths.config) {
+                    Ok(()) => self.set_config(cfg),
+                    Err(e) => self.toast(&format!("Couldn't save the goals: {e:#}")),
                 }
             }
             Action::Review => review_dialog::show(self),

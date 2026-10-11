@@ -17,14 +17,14 @@ pub fn show(app: &Rc<App>) {
         .build();
 
     let goal_group = adw::PreferencesGroup::builder().title("Daily Goal").build();
-    let goal = adw::SpinRow::with_range(5.0, 600.0, 5.0);
-    goal.set_title("Learning minutes per day");
+    let goal = adw::SpinRow::with_range(0.0, 600.0, 5.0);
+    goal.set_title("Video minutes per day");
+    goal.set_subtitle("Lectures plus card review; 0 turns it off");
     goal.set_value(f64::from(old.daily_goal_minutes));
-    let per_page = adw::SpinRow::with_range(0.5, 15.0, 0.5);
-    per_page.set_title("Minutes per book page");
-    per_page.set_subtitle("How much one page read counts toward the goal");
-    per_page.set_digits(1);
-    per_page.set_value(old.minutes_per_page);
+    let pages = adw::SpinRow::with_range(0.0, 1000.0, 5.0);
+    pages.set_title("Book pages per day");
+    pages.set_subtitle("0 turns it off");
+    pages.set_value(f64::from(old.daily_goal_pages));
     let threshold = adw::SpinRow::with_range(50.0, 100.0, 1.0);
     threshold.set_title("Lecture counts as done at (%)");
     threshold.set_value((old.complete_threshold * 100.0).round());
@@ -32,7 +32,7 @@ pub fn show(app: &Rc<App>) {
     let reminder = time_row("Daily reminder at", &old.reminder_time);
     for w in [
         goal.upcast_ref::<gtk::Widget>(),
-        per_page.upcast_ref(),
+        pages.upcast_ref(),
         threshold.upcast_ref(),
         day_start.upcast_ref(),
         reminder.upcast_ref(),
@@ -90,7 +90,7 @@ pub fn show(app: &Rc<App>) {
             video_dirs: video_dirs.borrow().clone(),
             book_dirs: book_dirs.borrow().clone(),
             daily_goal_minutes: goal.value().round() as u32,
-            minutes_per_page: per_page.value(),
+            daily_goal_pages: pages.value().round() as u32,
             complete_threshold: threshold.value() / 100.0,
             day_starts_at: valid_time(&day_start, &old.day_starts_at),
             reminder_time: valid_time(&reminder, &old.reminder_time),

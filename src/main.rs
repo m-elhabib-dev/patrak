@@ -23,7 +23,7 @@ enum Cmd {
         #[arg(long, value_parser = ["today", "courses", "books", "stats"])]
         page: Option<String>,
     },
-    /// Today's learning time against the goal, and what's next
+    /// Today's minutes and pages against the daily goals, and what's next
     Today,
     /// Progress of every course and book, or the lectures of one course
     Status { query: Option<String> },
@@ -65,7 +65,7 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Send a desktop notification if today's goal isn't met yet (run by the timer)
+    /// Send a desktop notification if today's goals aren't met yet (run by the timer)
     Remind,
     /// Write the config and library folders; install the mpv script, launcher and reminder timer
     Setup {

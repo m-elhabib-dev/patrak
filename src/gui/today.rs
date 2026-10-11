@@ -9,10 +9,15 @@ use patrak::progress::{Snapshot, fmt_duration, item_status};
 
 pub struct TodayPage {
     pub root: gtk::ScrolledWindow,
+    /// The two goal meters; the window stacks them when narrow.
+    pub meters: gtk::Box,
     date: gtk::Label,
-    minutes: gtk::Label,
-    level: gtk::LevelBar,
-    remaining: gtk::Label,
+    goal_edit: gtk::MenuButton,
+    minutes_goal: adw::SpinRow,
+    pages_goal: adw::SpinRow,
+    video_meter: GoalMeter,
+    book_meter: GoalMeter,
+    summary: gtk::Label,
     streak: gtk::Label,
     best: gtk::Label,
     plan_box: gtk::Box,
@@ -29,19 +34,23 @@ impl TodayPage {
         let (root, content) = page(720);
 
         let date = label("", &["dim-label", "title-4"]);
-        let minutes = label("", &["big-number", "numeric"]);
-        let level = gtk::LevelBar::for_interval(0.0, 1.0);
-        level.add_css_class("goal");
-        let remaining = label("", &["dim-label"]);
-        let goal_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        for w in [
-            date.upcast_ref::<gtk::Widget>(),
-            minutes.upcast_ref(),
-            level.upcast_ref(),
-            remaining.upcast_ref(),
-        ] {
-            goal_box.append(w);
-        }
+        date.set_hexpand(true);
+        let (goal_edit, minutes_goal, pages_goal) = goal_editor(&act);
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.append(&date);
+        header.append(&goal_edit);
+
+        let video_meter = goal_meter("Videos");
+        let book_meter = goal_meter("Reading");
+        let meters = gtk::Box::builder().spacing(24).homogeneous(true).build();
+        meters.append(&video_meter.root);
+        meters.append(&book_meter.root);
+        let summary = label("", &["dim-label"]);
+
+        let goal_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        goal_box.append(&header);
+        goal_box.append(&meters);
+        goal_box.append(&summary);
         content.append(&goal_box);
 
         let (streak_card, streak) = stat_card("day streak");
@@ -62,10 +71,14 @@ impl TodayPage {
 
         Self {
             root,
+            meters,
             date,
-            minutes,
-            level,
-            remaining,
+            goal_edit,
+            minutes_goal,
+            pages_goal,
+            video_meter,
+            book_meter,
+            summary,
             streak,
             best,
             plan_box,
@@ -79,17 +92,34 @@ impl TodayPage {
     }
 
     pub fn update(&self, snap: &Snapshot) {
-        let mins = snap.today_minutes();
+        let (studied, goals) = (snap.studied_today(), snap.goals);
         self.date
             .set_label(&snap.today.format("%A, %-d %B").to_string());
-        self.minutes
-            .set_label(&format!("{mins:.0} / {:.0} min", snap.goal));
-        self.level.set_value((mins / snap.goal).min(1.0));
-        self.remaining.set_label(&if mins >= snap.goal {
-            "Daily goal reached. Nice work!".to_owned()
+        self.video_meter
+            .set(studied.minutes, goals.minutes, "min", |left| {
+                format!("{} to go", fmt_duration(left * 60.0))
+            });
+        self.book_meter
+            .set(studied.pages as f64, goals.pages, "pages", |left| {
+                match left.ceil() as i64 {
+                    1 => "1 page to go".to_owned(),
+                    n => format!("{n} pages to go"),
+                }
+            });
+        let summary = if goals.minutes <= 0.0 && goals.pages <= 0.0 {
+            Some("No daily goal set. Use the pencil button to set one.")
+        } else if goals.met(studied) {
+            Some("Daily goal reached. Nice work!")
         } else {
-            format!("{} to go", fmt_duration((snap.goal - mins) * 60.0))
-        });
+            None
+        };
+        self.summary.set_visible(summary.is_some());
+        self.summary.set_label(summary.unwrap_or_default());
+        // Leave the spinners alone while they're being edited.
+        if !self.goal_edit.is_active() {
+            self.minutes_goal.set_value(goals.minutes);
+            self.pages_goal.set_value(goals.pages);
+        }
         self.streak.set_label(&snap.streak.to_string());
         self.best.set_label(&snap.best_streak.to_string());
 
@@ -230,6 +260,95 @@ impl TodayPage {
             self.today_list.append(&r);
         }
     }
+}
+
+/// Progress toward one daily goal: "32 / 45 min", a bar, and what's left.
+struct GoalMeter {
+    root: gtk::Box,
+    value: gtk::Label,
+    level: gtk::LevelBar,
+    left: gtk::Label,
+}
+
+impl GoalMeter {
+    /// Hidden when `goal` is 0; `to_go` words the amount still missing.
+    fn set(&self, done: f64, goal: f64, unit: &str, to_go: impl Fn(f64) -> String) {
+        self.root.set_visible(goal > 0.0);
+        if goal <= 0.0 {
+            return;
+        }
+        self.value
+            .set_label(&format!("{done:.0} / {goal:.0} {unit}"));
+        self.level.set_value((done / goal).min(1.0));
+        self.left.set_label(&if done >= goal {
+            "Done".to_owned()
+        } else {
+            to_go(goal - done)
+        });
+    }
+}
+
+fn goal_meter(caption: &str) -> GoalMeter {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let value = value_label("", &["big-number", "numeric"]);
+    value.set_halign(gtk::Align::Start);
+    let level = gtk::LevelBar::for_interval(0.0, 1.0);
+    level.add_css_class("goal");
+    let left = label("", &["dim-label"]);
+    root.append(&label(caption, &["heading"]));
+    root.append(&value);
+    root.append(&level);
+    root.append(&left);
+    GoalMeter {
+        root,
+        value,
+        level,
+        left,
+    }
+}
+
+/// The pencil button and its popover for changing the daily goals; returns
+/// (button, minutes row, pages row). Closing the popover saves the goals.
+fn goal_editor(act: &Act) -> (gtk::MenuButton, adw::SpinRow, adw::SpinRow) {
+    let minutes = adw::SpinRow::with_range(0.0, 600.0, 5.0);
+    minutes.set_title("Video minutes");
+    let pages = adw::SpinRow::with_range(0.0, 1000.0, 5.0);
+    pages.set_title("Book pages");
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    list.add_css_class("boxed-list");
+    list.append(&minutes);
+    list.append(&pages);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_width_request(300);
+    content.append(&label("Daily goals", &["heading"]));
+    content.append(&list);
+    content.append(&label(
+        "Card review counts as video time. 0 turns a goal off.",
+        &["dim-label", "caption"],
+    ));
+    let popover = gtk::Popover::builder().child(&content).build();
+    let (m, p, act) = (minutes.clone(), pages.clone(), act.clone());
+    popover.connect_closed(move |_| {
+        // Take a number typed without pressing Enter.
+        m.update();
+        p.update();
+        act(Action::SetGoals {
+            minutes: m.value().round() as u32,
+            pages: p.value().round() as u32,
+        });
+    });
+
+    let button = gtk::MenuButton::builder()
+        .icon_name("document-edit-symbolic")
+        .tooltip_text("Change daily goals")
+        .valign(gtk::Align::Center)
+        .popover(&popover)
+        .build();
+    button.add_css_class("flat");
+    (button, minutes, pages)
 }
 
 fn stat_card(caption: &str) -> (gtk::Box, gtk::Label) {

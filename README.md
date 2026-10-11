@@ -44,11 +44,21 @@ You can add other folders, such as `~/Videos/Youtube`, in Preferences → Librar
 | --- | --- |
 | mpv script (`assets/patrak.lua`) | Real watch time (paused time doesn't count), position, and "finished" when a lecture plays to its end |
 | mpv `watch_later` files | Saved positions, including history from before you installed patrak |
-| zathura `bookmarks.sqlite` | The current page of each book; pages read count toward the goal (`minutes_per_page`) |
+| zathura `bookmarks.sqlite` | The current page of each book; pages read count toward the pages goal |
 
 The library is synced every time the GUI refreshes and every time a CLI command runs. While mpv is playing,
 the window updates about once a minute. Study done before `day_starts_at` (04:00 by default) counts for the
 previous day.
+
+## Daily goals
+
+There are two daily goals: minutes of video (`daily_goal_minutes`, 60 by default) and book pages
+(`daily_goal_pages`, 20 by default).
+
+- Change them with the pencil button on the Today page, or in Preferences.
+- Card review time counts toward the minutes goal.
+- A day counts toward your streak, and shows green in the heatmap, only when every goal is met.
+- Set a goal to 0 to turn it off, for example to track only videos.
 
 ## Deadlines
 
@@ -111,13 +121,13 @@ A: Every future leader has them.
 - Cards are scheduled like Anki (Again / Hard / Good / Easy).
 - Review them in the window's **Review** dialog (Space shows the answer, keys 1–4 grade it) or
   with `patrak review`.
-- Review time counts toward the daily goal.
+- Review time counts toward the minutes goal.
 
 ## CLI
 
 ```
 patrak                   open the window (patrak gui --page stats opens a specific page)
-patrak today             minutes vs goal, streak, next lecture
+patrak today             minutes and pages vs goals, streak, next lecture
 patrak status [course]   all courses and books, or one course's lectures and chapters
 patrak play [query]      play a course in mpv from the next lecture; mpv moves on to the next one by itself
 patrak read [book]       open a book in zathura
