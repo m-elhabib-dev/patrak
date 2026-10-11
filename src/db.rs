@@ -137,6 +137,23 @@ CREATE TABLE review_daily (
 );
 ";
 
+/// Version 3: custom habits. `created` is the first study day a habit counts on.
+const SCHEMA_V3: &str = "
+CREATE TABLE habits (
+    id      INTEGER PRIMARY KEY,
+    name    TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    unit    TEXT    NOT NULL,
+    goal    INTEGER NOT NULL,
+    created TEXT    NOT NULL
+);
+CREATE TABLE habit_daily (
+    date     TEXT    NOT NULL,
+    habit_id INTEGER NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
+    amount   INTEGER NOT NULL,
+    PRIMARY KEY (date, habit_id)
+);
+";
+
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -164,6 +181,11 @@ fn init(conn: &Connection) -> Result<()> {
     if version < 2 {
         conn.execute_batch(&format!(
             "BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"
+        ))?;
+    }
+    if version < 3 {
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;"
         ))?;
     }
     Ok(())

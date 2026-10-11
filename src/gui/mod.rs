@@ -1,6 +1,8 @@
 mod books;
 mod courses;
 mod download_dialog;
+mod habit_dialog;
+mod habits;
 mod notes;
 mod prefs;
 mod review_dialog;
@@ -53,6 +55,13 @@ pub enum Action {
         pages: u32,
     },
     Review,
+    /// Today's amount of a habit, replacing what was logged before.
+    LogHabit {
+        id: i64,
+        amount: i64,
+    },
+    NewHabit,
+    EditHabit(i64),
     /// Look for new episodes of a downloaded course.
     CheckCourse(PathBuf),
     /// Download new episodes of a downloaded course.
@@ -74,7 +83,7 @@ const CSS: &str = "
 levelbar.goal block { min-height: 14px; border-radius: 7px; }
 ";
 
-/// Opens the window, showing `page` (today, courses, books or stats) if given.
+/// Opens the window, showing `page` (today, courses, books, habits or stats) if given.
 pub fn run(page: Option<String>) {
     let app = adw::Application::builder()
         .application_id(setup::APP_ID)
@@ -109,6 +118,7 @@ struct App {
     today: today::TodayPage,
     courses: courses::CoursesPage,
     books: books::BooksPage,
+    habits: habits::HabitsPage,
     stats: stats::StatsPage,
     paths: Paths,
     cfg: RefCell<Config>,
@@ -137,6 +147,7 @@ impl App {
             let today = today::TodayPage::new(act.clone());
             let courses = courses::CoursesPage::new(act.clone());
             let books = books::BooksPage::new(act.clone());
+            let habits = habits::HabitsPage::new(act.clone());
             let stats = stats::StatsPage::new();
 
             let stack = adw::ViewStack::new();
@@ -152,6 +163,12 @@ impl App {
                 Some("books"),
                 "Books",
                 "accessories-dictionary-symbolic",
+            );
+            stack.add_titled_with_icon(
+                &habits.root,
+                Some("habits"),
+                "Habits",
+                "object-select-symbolic",
             );
             stack.add_titled_with_icon(
                 &stats.root,
@@ -237,6 +254,7 @@ impl App {
                 today,
                 courses,
                 books,
+                habits,
                 stats,
                 paths,
                 cfg: RefCell::new(cfg),
@@ -372,6 +390,21 @@ impl App {
                 }
             }
             Action::Review => review_dialog::show(self),
+            // The day on screen, which the amount was read from.
+            Action::LogHabit { id, amount } => {
+                let result = db::open(&self.paths.db())
+                    .and_then(|conn| patrak::habits::set_amount(&conn, id, snap.today, amount));
+                match result {
+                    Ok(()) => self.refresh(),
+                    Err(e) => self.toast(&format!("Couldn't log the habit: {e:#}")),
+                }
+            }
+            Action::NewHabit => habit_dialog::show(self, None),
+            Action::EditHabit(id) => {
+                if let Some(h) = snap.habits.iter().find(|h| h.habit.id == id) {
+                    habit_dialog::show(self, Some(h.habit.clone()));
+                }
+            }
             Action::CheckCourse(dir) => self.check_sources(vec![dir], true),
             Action::UpdateCourse(dir) => download_dialog::show_update(self, dir),
             Action::OpenUrl(url) => {
@@ -460,6 +493,7 @@ impl App {
         self.today.update(&snap);
         self.courses.update(&snap);
         self.books.update(&snap);
+        self.habits.update(&snap);
         self.stats.update(&snap);
         *self.snapshot.borrow_mut() = Some(snap.clone());
         self.check_stale_sources(&snap);

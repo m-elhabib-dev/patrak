@@ -1,6 +1,7 @@
 pub mod config;
 pub mod db;
 pub mod download;
+pub mod habits;
 pub mod launch;
 pub mod library;
 pub mod progress;

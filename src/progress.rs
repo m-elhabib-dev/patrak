@@ -1,11 +1,12 @@
 use crate::config::{Config, days_back};
 use crate::db::{self, Item, Kind};
 use crate::download::Source;
+use crate::habits::{self, HabitStatus};
 use crate::review;
 use anyhow::Result;
 use chrono::{Datelike, Duration, NaiveDate};
 use rusqlite::Connection;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Days of history used to estimate a course's pace and finishing date.
@@ -136,11 +137,17 @@ pub struct Day {
     /// Lectures watched plus cards reviewed.
     pub minutes: f64,
     pub pages: i64,
+    /// Habits that counted this day (those added by then).
+    pub habits_due: u32,
+    /// Habits whose goal was reached.
+    pub habits_met: u32,
+    /// Sum of each habit's share of its goal, each capped at 1.
+    pub habits_share: f64,
 }
 
 impl Day {
     pub fn is_empty(&self) -> bool {
-        self.minutes <= 0.0 && self.pages <= 0
+        self.minutes <= 0.0 && self.pages <= 0 && self.habits_share <= 0.0
     }
 }
 
@@ -148,6 +155,9 @@ impl std::ops::AddAssign for Day {
     fn add_assign(&mut self, other: Day) {
         self.minutes += other.minutes;
         self.pages += other.pages;
+        self.habits_due += other.habits_due;
+        self.habits_met += other.habits_met;
+        self.habits_share += other.habits_share;
     }
 }
 
@@ -161,7 +171,7 @@ impl std::iter::Sum for Day {
     }
 }
 
-/// Daily goals; 0 turns a goal off.
+/// Daily goals; 0 turns a goal off. Each habit due that day is a goal too.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Goals {
     pub minutes: f64,
@@ -169,18 +179,19 @@ pub struct Goals {
 }
 
 impl Goals {
-    /// 0 to 1: the average share of each goal that's on, each share capped at 1.
-    /// With no goal on, any study counts as 1.
+    /// 0 to 1: the average share of each goal that's on, habits included, each share capped
+    /// at 1. With no goal on, any study counts as 1.
     pub fn progress(&self, day: Day) -> f64 {
         let shares: Vec<f64> = [(day.minutes, self.minutes), (day.pages as f64, self.pages)]
             .into_iter()
             .filter(|&(_, goal)| goal > 0.0)
             .map(|(done, goal)| (done / goal).clamp(0.0, 1.0))
             .collect();
-        if shares.is_empty() {
+        let goals = shares.len() + day.habits_due as usize;
+        if goals == 0 {
             return if day.is_empty() { 0.0 } else { 1.0 };
         }
-        shares.iter().sum::<f64>() / shares.len() as f64
+        (shares.iter().sum::<f64>() + day.habits_share) / goals as f64
     }
 
     pub fn met(&self, day: Day) -> bool {
@@ -203,6 +214,8 @@ pub struct Snapshot {
     pub cards_due: usize,
     pub cards_total: usize,
     pub reviewed_today: i64,
+    /// Oldest first.
+    pub habits: Vec<HabitStatus>,
 }
 
 impl Snapshot {
@@ -281,6 +294,23 @@ impl Snapshot {
             .collect()
     }
 
+    /// Habits whose name contains `query`, or just the one named exactly that, so "Run" can
+    /// still be picked next to "Running".
+    pub fn find_habits(&self, query: &str) -> Vec<&HabitStatus> {
+        let found: Vec<&HabitStatus> = self
+            .habits
+            .iter()
+            .filter(|h| matches(&h.habit.name, query))
+            .collect();
+        match found
+            .iter()
+            .find(|h| h.habit.name.to_lowercase() == query.trim().to_lowercase())
+        {
+            Some(&exact) => vec![exact],
+            None => found,
+        }
+    }
+
     /// Totals per week for the last `weeks` weeks (Monday first), oldest first.
     pub fn weekly(&self, weeks: usize) -> Vec<(NaiveDate, Day)> {
         let this_monday =
@@ -336,10 +366,9 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
     let mut today_secs: HashMap<&str, f64> = HashMap::new();
     let pace_from = days_back(today, PACE_DAYS - 1);
     for row in &daily {
-        *days.entry(row.date).or_default() += Day {
-            minutes: row.seconds / 60.0,
-            pages: row.pages,
-        };
+        let day = days.entry(row.date).or_default();
+        day.minutes += row.seconds / 60.0;
+        day.pages += row.pages;
         let Some(item) = by_id.get(&row.item_id) else {
             continue;
         };
@@ -376,6 +405,29 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
     }
     let (cards_due, cards_total) = review::counts(conn, today)?;
     let deadlines = db::deadlines(conn)?;
+
+    let habit_list = habits::list(conn)?;
+    let habit_logs = habits::daily(conn)?;
+    if !habit_list.is_empty() {
+        let amounts: HashMap<(NaiveDate, i64), i64> = habit_logs
+            .iter()
+            .map(|&(date, id, amount)| ((date, id), amount))
+            .collect();
+        // Today too, so a day with no habit logged yet isn't counted as met.
+        let mut dates: BTreeSet<NaiveDate> = days.keys().copied().collect();
+        dates.extend(habit_logs.iter().map(|l| l.0));
+        dates.insert(today);
+        for date in dates {
+            let day = days.entry(date).or_default();
+            for habit in habit_list.iter().filter(|h| h.created <= date) {
+                let amount = amounts.get(&(date, habit.id)).copied().unwrap_or(0);
+                day.habits_due += 1;
+                day.habits_met += u32::from(habit.met(amount));
+                day.habits_share += habit.share(amount);
+            }
+        }
+    }
+    let habits = habits::statuses(&habit_list, &habit_logs, today);
 
     let mut grouped: BTreeMap<&str, Vec<&Item>> = BTreeMap::new();
     for item in items.iter().filter(|i| i.kind == Kind::Video) {
@@ -426,6 +478,7 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
         cards_due,
         cards_total,
         reviewed_today,
+        habits,
     })
 }
 
@@ -481,10 +534,23 @@ fn next_lecture(lectures: &[Item]) -> Option<usize> {
         .or_else(|| lectures.iter().position(|l| !l.is_done()))
 }
 
-/// (current, best). Today only counts toward the current streak once the goals are met,
-/// so an unfinished today doesn't break a streak that ran through yesterday.
+/// (current, best) streaks of days that met the goals.
 pub fn streaks(days: &BTreeMap<NaiveDate, Day>, goals: Goals, today: NaiveDate) -> (usize, usize) {
-    let met = |d: NaiveDate| days.get(&d).is_some_and(|&s| goals.met(s));
+    streaks_by(
+        days.keys().copied(),
+        |d| days.get(&d).is_some_and(|&s| goals.met(s)),
+        today,
+    )
+}
+
+/// (current, best) streaks of days that `met` accepts; `days` lists, in order, every day that
+/// might be. Today only counts toward the current streak once it is met, so an unfinished
+/// today doesn't break a streak that ran through yesterday.
+pub fn streaks_by(
+    days: impl IntoIterator<Item = NaiveDate>,
+    met: impl Fn(NaiveDate) -> bool,
+    today: NaiveDate,
+) -> (usize, usize) {
     let mut day = if met(today) {
         today
     } else {
@@ -499,8 +565,8 @@ pub fn streaks(days: &BTreeMap<NaiveDate, Day>, goals: Goals, today: NaiveDate) 
     let mut best = 0;
     let mut run = 0;
     let mut prev: Option<NaiveDate> = None;
-    for (&d, &s) in days {
-        if !goals.met(s) {
+    for d in days {
+        if !met(d) {
             continue;
         }
         run = if prev == Some(d - Duration::days(1)) {
@@ -578,7 +644,11 @@ mod tests {
     }
 
     fn studied(minutes: f64, pages: i64) -> Day {
-        Day { minutes, pages }
+        Day {
+            minutes,
+            pages,
+            ..Day::default()
+        }
     }
 
     const MINUTES_ONLY: Goals = Goals {
@@ -644,6 +714,69 @@ mod tests {
         };
         assert!(!none.met(Day::default()));
         assert!(none.met(studied(0.0, 1)));
+    }
+
+    #[test]
+    fn goal_progress_counts_habits() {
+        // 60 minutes watched, one of two habits done and the other half way.
+        let day = Day {
+            habits_due: 2,
+            habits_met: 1,
+            habits_share: 1.5,
+            ..studied(60.0, 0)
+        };
+        assert_eq!(MINUTES_ONLY.progress(day), 2.5 / 3.0);
+        assert!(!MINUTES_ONLY.met(day));
+        let all_done = Day {
+            habits_met: 2,
+            habits_share: 2.0,
+            ..day
+        };
+        assert!(MINUTES_ONLY.met(all_done));
+        // Habits alone are the goal when the others are off.
+        let none = Goals {
+            minutes: 0.0,
+            pages: 0.0,
+        };
+        assert_eq!(none.progress(day), 0.75);
+    }
+
+    #[test]
+    fn habits_gate_the_streak_from_the_day_they_were_added() {
+        let conn = db::open_in_memory().unwrap();
+        let cfg = Config {
+            daily_goal_minutes: 0,
+            daily_goal_pages: 0,
+            ..Config::default()
+        };
+        let today = cfg.today();
+        let day = |n: i64| today - Duration::days(n);
+        let eat = habits::add(&conn, "Eat", habits::Unit::Count, 3, day(2)).unwrap();
+        let run = habits::add(&conn, "Run", habits::Unit::Minutes, 30, day(1)).unwrap();
+        for (date, id, amount) in [
+            (day(3), eat, 3),
+            (day(2), eat, 3),
+            (day(1), eat, 3),
+            (day(1), run, 45),
+            (today, eat, 3),
+        ] {
+            habits::set_amount(&conn, id, date, amount).unwrap();
+        }
+
+        let snap = build(&conn, &cfg).unwrap();
+        // Day 3 came before "Eat" was added; today "Run" is still missing.
+        assert_eq!(snap.studied_on(day(3)).habits_due, 0);
+        assert_eq!(snap.studied_on(day(1)).habits_met, 2);
+        assert!(!snap.goals.met(snap.studied_today()));
+        assert_eq!((snap.streak, snap.best_streak), (2, 2));
+        assert_eq!(snap.habits.len(), 2);
+        assert_eq!((snap.habits[0].today, snap.habits[0].streak), (3, 3));
+        assert!(snap.habits[0].done() && !snap.habits[1].done());
+
+        habits::set_amount(&conn, run, today, 30).unwrap();
+        let snap = build(&conn, &cfg).unwrap();
+        assert!(snap.goals.met(snap.studied_today()));
+        assert_eq!(snap.streak, 3);
     }
 
     fn lecture(ord: i64, position_ts: i64, done: bool) -> Item {

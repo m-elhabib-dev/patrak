@@ -123,8 +123,13 @@ impl StatsPage {
                 if date <= snap.today {
                     cell.add_css_class(&format!("heat-{}", snap.heat_level(date)));
                     let studied = snap.studied_on(date);
+                    let habits = if studied.habits_due > 0 {
+                        format!("  ·  {}/{} habits", studied.habits_met, studied.habits_due)
+                    } else {
+                        String::new()
+                    };
                     cell.set_tooltip_text(Some(&format!(
-                        "{}  ·  {:.0} min  ·  {} pages",
+                        "{}  ·  {:.0} min  ·  {} pages{habits}",
                         date.format("%a %-d %b"),
                         studied.minutes,
                         studied.pages

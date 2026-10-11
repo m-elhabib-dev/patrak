@@ -106,15 +106,24 @@ impl TodayPage {
                     n => format!("{n} pages to go"),
                 }
             });
-        let summary = if goals.minutes <= 0.0 && goals.pages <= 0.0 {
-            Some("No daily goal set. Use the pencil button to set one.")
+        let habits_left: Vec<String> = snap
+            .habits
+            .iter()
+            .filter(|h| !h.done())
+            .map(|h| isolate(&h.habit.name))
+            .collect();
+        let summary = if goals.minutes <= 0.0 && goals.pages <= 0.0 && snap.habits.is_empty() {
+            Some("No daily goal set. Use the pencil button to set one.".to_owned())
         } else if goals.met(studied) {
-            Some("Daily goal reached. Nice work!")
+            Some("Daily goal reached. Nice work!".to_owned())
+        } else if !habits_left.is_empty() {
+            Some(format!("Habits left today: {}", habits_left.join(", ")))
         } else {
             None
         };
         self.summary.set_visible(summary.is_some());
-        self.summary.set_label(summary.unwrap_or_default());
+        self.summary
+            .set_label(summary.as_deref().unwrap_or_default());
         // Leave the spinners alone while they're being edited.
         if !self.goal_edit.is_active() {
             self.minutes_goal.set_value(goals.minutes);

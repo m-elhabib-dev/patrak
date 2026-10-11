@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{Datelike, Duration, NaiveDate};
 use patrak::Session;
 use patrak::db::{self, Item, Kind};
+use patrak::habits::{self, Habit, HabitStatus, Unit};
 use patrak::progress::{Course, Day, Snapshot, fmt_clock, fmt_duration, item_status};
 use patrak::review::{self, Card, Grade};
 use patrak::{config::Config, download, launch, setup, sync::set_done};
@@ -75,14 +76,30 @@ fn goal_part(done: f64, goal: f64, unit: &str) -> String {
 
 fn print_today(snap: &Snapshot) {
     let studied = snap.studied_today();
+    let habits = if snap.habits.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "   habits {}/{}",
+            bold(&studied.habits_met.to_string()),
+            studied.habits_due
+        )
+    };
     println!(
-        "{}  {}   {}   streak {} (best {})",
+        "{}  {}   {}{habits}   streak {} (best {})",
         bold(&snap.today.format("%a %d %b").to_string()),
         goal_part(studied.minutes, snap.goals.minutes, "min"),
         goal_part(studied.pages as f64, snap.goals.pages, "pages"),
         bold(&snap.streak.to_string()),
         snap.best_streak,
     );
+
+    if !snap.habits.is_empty() {
+        println!("\n{}", bold("Habits"));
+        for h in &snap.habits {
+            print_habit(h);
+        }
+    }
 
     if !snap.today_entries.is_empty() {
         println!("\n{}", bold("Today"));
@@ -147,6 +164,75 @@ fn print_today(snap: &Snapshot) {
     if let Some(book) = snap.last_book() {
         println!("  📖 {}  {}", book.title, dim(&item_status(book)));
     }
+}
+
+/// "████████████ 3 / 3 times  Eat  · 4-day streak"
+fn print_habit(h: &HabitStatus) {
+    let streak = h
+        .streak_text()
+        .map(|s| dim(&format!("  · {s}")))
+        .unwrap_or_default();
+    println!(
+        "  {}  {}{streak}",
+        goal_part(
+            h.today as f64,
+            h.habit.goal as f64,
+            h.habit.unit.word(h.habit.goal)
+        ),
+        bold(&h.habit.name)
+    );
+}
+
+pub fn habits() -> Result<()> {
+    let (_, snap) = session()?;
+    if snap.habits.is_empty() {
+        println!("No habits yet. Add them on the Habits page: patrak gui --page habits");
+    }
+    for h in &snap.habits {
+        print_habit(h);
+    }
+    Ok(())
+}
+
+pub fn habit(query: String, amount: Option<String>) -> Result<()> {
+    let (session, snap) = session()?;
+    let found = one(snap.find_habits(&query), "habit", &query, |h| {
+        h.habit.name.clone()
+    })?;
+    let id = found.habit.id;
+    let amount = parse_amount(amount.as_deref(), found.today, &found.habit)?;
+    habits::set_amount(&session.conn, id, snap.today, amount)?;
+    let snap = session.snapshot()?;
+    let status = snap
+        .habits
+        .iter()
+        .find(|h| h.habit.id == id)
+        .context("habit vanished")?;
+    print_habit(status);
+    Ok(())
+}
+
+/// Today's new amount: `3` sets it, `+2` and `-1` change it. With no amount, a count goes up
+/// by one and a minutes habit is completed.
+fn parse_amount(arg: Option<&str>, current: i64, habit: &Habit) -> Result<i64> {
+    let Some(arg) = arg.map(str::trim) else {
+        return Ok(match habit.unit {
+            Unit::Count => current + 1,
+            Unit::Minutes => current.max(habit.goal),
+        });
+    };
+    let number = |s: &str| {
+        s.parse::<i64>()
+            .with_context(|| format!("{arg:?} isn't an amount like 3, +2 or -1"))
+    };
+    let amount = if let Some(n) = arg.strip_prefix('+') {
+        current + number(n)?
+    } else if let Some(n) = arg.strip_prefix('-') {
+        current - number(n)?
+    } else {
+        number(arg)?
+    };
+    Ok(amount.max(0))
 }
 
 pub fn status(query: Option<String>) -> Result<()> {
@@ -414,6 +500,13 @@ pub fn remind() -> Result<()> {
     }
     if (studied.pages as f64) < goals.pages {
         short.push(format!("{} of {:.0} pages", studied.pages, goals.pages));
+    }
+    for h in snap.habits.iter().filter(|h| !h.done()) {
+        short.push(format!(
+            "{} {}",
+            h.habit.name,
+            h.habit.progress_text(h.today)
+        ));
     }
     let mut body = if short.is_empty() {
         "Nothing studied yet today.".to_owned()
@@ -733,5 +826,25 @@ mod tests {
         assert_eq!(parse_when("clear", today).unwrap(), None);
         assert!(parse_when("+3y", today).is_err());
         assert!(parse_when("next friday", today).is_err());
+    }
+
+    #[test]
+    fn reads_habit_amounts() {
+        let habit = |unit| Habit {
+            id: 1,
+            name: "Run".into(),
+            unit,
+            goal: 30,
+            created: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+        };
+        let (count, minutes) = (habit(Unit::Count), habit(Unit::Minutes));
+        assert_eq!(parse_amount(None, 2, &count).unwrap(), 3);
+        assert_eq!(parse_amount(None, 10, &minutes).unwrap(), 30);
+        assert_eq!(parse_amount(None, 45, &minutes).unwrap(), 45);
+        assert_eq!(parse_amount(Some("+15"), 10, &minutes).unwrap(), 25);
+        assert_eq!(parse_amount(Some("-1"), 2, &count).unwrap(), 1);
+        assert_eq!(parse_amount(Some("-5"), 2, &count).unwrap(), 0);
+        assert_eq!(parse_amount(Some("4"), 2, &count).unwrap(), 4);
+        assert!(parse_amount(Some("lots"), 2, &count).is_err());
     }
 }

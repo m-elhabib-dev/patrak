@@ -57,8 +57,29 @@ There are two daily goals: minutes of video (`daily_goal_minutes`, 60 by default
 
 - Change them with the pencil button on the Today page, or in Preferences.
 - Card review time counts toward the minutes goal.
+- Each [habit](#habits) is a goal too.
 - A day counts toward your streak, and shows green in the heatmap, only when every goal is met.
 - Set a goal to 0 to turn it off, for example to track only videos.
+
+## Habits
+
+Track anything else you do every day on the **Habits** page, for example running 30 minutes or
+eating three times. Use **New Habit** to give one a name, a unit (times or minutes) and a daily goal.
+
+- Set today's amount with − and +, or type it in.
+- Each habit shows its own streak.
+- Habits are part of the daily goal. A day keeps your streak only when every habit is done too, and
+  the evening reminder lists the ones still missing.
+- A habit counts from the day you add it, so adding one doesn't break past streaks.
+- Deleting a habit deletes its history.
+
+From the terminal:
+
+```sh
+patrak habits            # today's habits
+patrak habit eat         # +1 for a count; a minutes habit is marked as done
+patrak habit run 45      # set today's amount; +15 or -1 change it instead
+```
 
 ## Deadlines
 
@@ -137,10 +158,12 @@ patrak deadline <c> <w>  set or clear a course deadline
 patrak add <url>         download a playlist as a course (--name to choose the folder)
 patrak update [course]   download new episodes (--check to only list them)
 patrak review            review the cards due today
+patrak habits            today's habits against their goals
+patrak habit <h> [n]     log a habit: n sets today's amount, +n or -n changes it
 patrak stats             heatmap, streaks, weekly totals
 patrak sync -v           rescan and show what changed
 ```
 
-Queries are case-insensitive substrings of course, lecture or book names.
+Queries are case-insensitive substrings of course, lecture, book or habit names.
 
 For testing on a scratch library, set `PATRAK_CONFIG` and `PATRAK_DATA_DIR` to use a separate config file and database.

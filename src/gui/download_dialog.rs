@@ -1,5 +1,5 @@
 use super::App;
-use super::widgets::{isolate, label};
+use super::widgets::{dialog, isolate, label};
 use adw::prelude::*;
 use gtk::{gio, glib};
 use patrak::download::{self, Plan, Progress};
@@ -92,17 +92,6 @@ pub fn show_update(app: &Rc<App>, dir: PathBuf) {
     let view = ProgressView::new();
     dialog(&format!("Updating {}", isolate(&plan.title)), &view.root).present(Some(&app.window));
     run(app, plan, view);
-}
-
-fn dialog(title: &str, child: &impl IsA<gtk::Widget>) -> adw::Dialog {
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
-    toolbar.set_content(Some(child));
-    adw::Dialog::builder()
-        .title(title)
-        .content_width(560)
-        .child(&toolbar)
-        .build()
 }
 
 /// Runs yt-dlp, showing its progress. Closing the dialog doesn't stop the download.
