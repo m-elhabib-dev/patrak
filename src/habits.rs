@@ -4,7 +4,7 @@
 use crate::progress;
 use anyhow::{Result, bail};
 use chrono::NaiveDate;
-use rusqlite::{Connection, ErrorCode, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +88,14 @@ impl Habit {
     /// "2 of 3 times" or "20 of 30 min".
     pub fn progress_text(&self, amount: i64) -> String {
         format!("{amount} of {}", self.unit.amount(self.goal))
+    }
+
+    /// The amount after a quick log: a count goes up by one and a minutes habit is completed.
+    pub fn quick_amount(&self, current: i64) -> i64 {
+        match self.unit {
+            Unit::Count => current + 1,
+            Unit::Minutes => current.max(self.goal),
+        }
     }
 }
 
@@ -177,6 +185,20 @@ pub fn set_amount(conn: &Connection, id: i64, date: NaiveDate, amount: i64) -> R
         )?;
     }
     Ok(())
+}
+
+/// Logs `habit` the quick way on `date` (see [`Habit::quick_amount`]), starting from the saved
+/// amount so clicks quicker than a refresh each count.
+pub fn quick_log(conn: &Connection, habit: &Habit, date: NaiveDate) -> Result<()> {
+    let current: i64 = conn
+        .query_row(
+            "SELECT amount FROM habit_daily WHERE date = ?1 AND habit_id = ?2",
+            params![date.to_string(), habit.id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    set_amount(conn, habit.id, date, habit.quick_amount(current))
 }
 
 /// (date, habit id, amount) for every day something was logged, oldest first.
@@ -283,6 +305,30 @@ mod tests {
             "history goes with the habit"
         );
         assert_eq!(list(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn quick_log_adds_a_time_or_completes_minutes() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let today = d("2026-10-11");
+        add(&conn, "Eat", Unit::Count, 3, today).unwrap();
+        add(&conn, "Run", Unit::Minutes, 30, today).unwrap();
+        let habits = list(&conn).unwrap();
+        let (eat, run) = (&habits[0], &habits[1]);
+
+        // Each log starts from what's saved, not from a stale amount.
+        quick_log(&conn, eat, today).unwrap();
+        quick_log(&conn, eat, today).unwrap();
+        set_amount(&conn, run.id, today, 10).unwrap();
+        quick_log(&conn, run, today).unwrap();
+        assert_eq!(
+            daily(&conn).unwrap(),
+            [(today, eat.id, 2), (today, run.id, 30)]
+        );
+
+        set_amount(&conn, run.id, today, 45).unwrap();
+        quick_log(&conn, run, today).unwrap();
+        assert_eq!(daily(&conn).unwrap()[1].2, 45, "more than the goal stays");
     }
 
     #[test]

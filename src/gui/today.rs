@@ -1,36 +1,34 @@
 use super::projects::{project_row, summary as project_summary};
 use super::widgets::{
-    done_check, icon_button, isolate, label, page, pill_button, placeholder_row, progress, row,
-    section, value_label,
+    done_check, done_mark, icon_button, isolate, label, page, pill_button, placeholder_row,
+    progress, row, section, section_with, value_label,
 };
 use super::{Act, Action};
 use adw::prelude::*;
 use patrak::db::Kind;
-use patrak::progress::{Snapshot, fmt_duration, item_status};
+use patrak::habits::{HabitStatus, Unit};
+use patrak::progress::{Snapshot, fmt_duration, item_status, short_title, streak_text};
+use patrak::projects;
 
 pub struct TodayPage {
     pub root: gtk::ScrolledWindow,
-    /// The two goal meters; the window stacks them when narrow.
-    pub meters: gtk::Box,
     date: gtk::Label,
     /// "Holiday", next to the date on a holiday.
     holiday: gtk::Label,
+    /// "3 of 4 goals done  ·  5-day streak"
+    summary: gtk::Label,
+    /// The share of every goal together, as the streak and heatmap see it.
+    overall: gtk::LevelBar,
     goal_edit: gtk::MenuButton,
     minutes_goal: adw::SpinRow,
     pages_goal: adw::SpinRow,
-    video_meter: GoalMeter,
-    book_meter: GoalMeter,
-    summary: gtk::Label,
-    streak: gtk::Label,
-    best: gtk::Label,
+    goals_list: gtk::ListBox,
+    next_list: gtk::ListBox,
     plan_box: gtk::Box,
     plan_list: gtk::ListBox,
-    continue_list: gtk::ListBox,
-    projects_box: gtk::Box,
-    projects_list: gtk::ListBox,
-    review_box: gtk::Box,
-    review_list: gtk::ListBox,
-    today_list: gtk::ListBox,
+    /// Today's minutes, pages and commits, next to the "Done Today" heading.
+    totals: gtk::Label,
+    done_list: gtk::ListBox,
     act: Act,
 }
 
@@ -38,138 +36,153 @@ impl TodayPage {
     pub fn new(act: Act) -> Self {
         let (root, content) = page(720);
 
-        let date = label("", &["dim-label", "title-4"]);
+        let date = label("", &["title-2"]);
         date.set_hexpand(true);
         let holiday = value_label("Holiday", &["holiday-pill", "caption"]);
         holiday.set_visible(false);
-        let (goal_edit, minutes_goal, pages_goal) = goal_editor(&act);
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        header.append(&date);
-        header.append(&holiday);
-        header.append(&goal_edit);
-
-        let video_meter = goal_meter("Videos");
-        let book_meter = goal_meter("Reading");
-        let meters = gtk::Box::builder().spacing(24).homogeneous(true).build();
-        meters.append(&video_meter.root);
-        meters.append(&book_meter.root);
+        let date_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        date_line.append(&date);
+        date_line.append(&holiday);
         let summary = label("", &["dim-label"]);
+        let overall = gtk::LevelBar::for_interval(0.0, 1.0);
+        overall.add_css_class("goal");
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        header.append(&date_line);
+        header.append(&summary);
+        header.append(&overall);
+        content.append(&header);
 
-        let goal_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        goal_box.append(&header);
-        goal_box.append(&meters);
-        goal_box.append(&summary);
-        content.append(&goal_box);
-
-        let (streak_card, streak) = stat_card("day streak");
-        let (best_card, best) = stat_card("best streak");
-        let cards = gtk::Box::builder().spacing(12).homogeneous(true).build();
-        cards.append(&streak_card);
-        cards.append(&best_card);
-        content.append(&cards);
-
-        let (plan_box, plan_list) = section("Today’s Plan");
-        let (continue_box, continue_list) = section("Continue");
-        let (projects_box, projects_list) = section("Projects");
-        let (review_box, review_list) = section("Review");
-        let (today_box, today_list) = section("Studied today");
+        let (goal_edit, minutes_goal, pages_goal) = goal_editor(&act);
+        let (goals_box, goals_list) = section_with("Goals", &goal_edit);
+        let (next_box, next_list) = section("Up Next");
+        let (plan_box, plan_list) = section("Deadlines");
+        let totals = value_label("", &["dim-label", "numeric"]);
+        let (done_box, done_list) = section_with("Done Today", &totals);
+        content.append(&goals_box);
+        content.append(&next_box);
         content.append(&plan_box);
-        content.append(&continue_box);
-        content.append(&projects_box);
-        content.append(&review_box);
-        content.append(&today_box);
+        content.append(&done_box);
 
         Self {
             root,
-            meters,
             date,
             holiday,
+            summary,
+            overall,
             goal_edit,
             minutes_goal,
             pages_goal,
-            video_meter,
-            book_meter,
-            summary,
-            streak,
-            best,
+            goals_list,
+            next_list,
             plan_box,
             plan_list,
-            continue_list,
-            projects_box,
-            projects_list,
-            review_box,
-            review_list,
-            today_list,
+            totals,
+            done_list,
             act,
         }
     }
 
     pub fn update(&self, snap: &Snapshot) {
+        self.update_header(snap);
+        self.update_goals(snap);
+        self.update_next(snap);
+        self.update_plan(snap);
+        self.update_done(snap);
+    }
+
+    fn update_header(&self, snap: &Snapshot) {
         let (studied, goals) = (snap.studied_today(), snap.goals);
         self.date
             .set_label(&snap.today.format("%A, %-d %B").to_string());
-        self.video_meter
-            .set(studied.minutes, goals.minutes, "min", |left| {
-                format!("{} to go", fmt_duration(left * 60.0))
-            });
-        self.book_meter
-            .set(studied.pages as f64, goals.pages, "pages", |left| {
-                match left.ceil() as i64 {
-                    1 => "1 page to go".to_owned(),
-                    n => format!("{n} pages to go"),
-                }
-            });
-        let left: Vec<String> = snap
-            .habits
-            .iter()
-            .filter(|h| !h.done())
-            .map(|h| isolate(&h.habit.name))
-            .chain(
-                snap.projects
-                    .iter()
-                    .filter(|p| p.project.has_goal() && !p.done())
-                    .map(|p| isolate(&p.project.name)),
-            )
-            .collect();
-        let no_goal = goals.minutes <= 0.0
-            && goals.pages <= 0.0
-            && snap.habits.is_empty()
-            && !snap.projects.iter().any(|p| p.project.has_goal());
-        // A holiday turns every goal off; what's done still shows, greyed out.
         let holiday = snap.holiday_today();
         self.holiday.set_visible(holiday);
-        self.meters.set_sensitive(!holiday);
-        self.projects_list.set_sensitive(!holiday);
-        let summary = if holiday {
-            Some("Holiday: today’s goals are off and your streak is safe.".to_owned())
-        } else if no_goal {
-            Some("No daily goal set. Use the pencil button to set one.".to_owned())
-        } else if goals.met(studied) {
-            Some("Daily goal reached. Nice work!".to_owned())
-        } else if !left.is_empty() {
-            Some(format!("Left today: {}", left.join(", ")))
+        let (met, total) = goals.tally(studied);
+        let status = if holiday {
+            "Holiday: today’s goals are off and your streak is safe".to_owned()
+        } else if total == 0 {
+            "No daily goals yet".to_owned()
+        } else if met == total {
+            "Every goal done today".to_owned()
         } else {
-            None
+            format!("{met} of {total} goals done")
         };
-        self.summary.set_visible(summary.is_some());
-        self.summary
-            .set_label(summary.as_deref().unwrap_or_default());
+        let line: Vec<String> = std::iter::once(status)
+            .chain(streak_text(snap.streak, snap.best_streak))
+            .collect();
+        self.summary.set_label(&line.join("  ·  "));
+        self.overall.set_visible(!holiday && total > 0);
+        self.overall.set_value(goals.progress(studied).min(1.0));
+    }
+
+    /// Every goal that decides the streak: minutes, pages, each habit and each project with a
+    /// goal. A holiday turns them off; what's done still shows, greyed out.
+    fn update_goals(&self, snap: &Snapshot) {
+        let (studied, goals) = (snap.studied_today(), snap.goals);
+        let list = &self.goals_list;
+        list.remove_all();
+        list.set_sensitive(!snap.holiday_today());
+        if goals.minutes > 0.0 {
+            let text = amount_text(studied.minutes, goals.minutes, "min", |left| {
+                fmt_duration(left * 60.0)
+            });
+            list.append(&goal_row(
+                "Videos",
+                &text,
+                studied.minutes / goals.minutes,
+                studied.minutes >= goals.minutes,
+                None,
+            ));
+        }
+        if goals.pages > 0.0 {
+            let done = studied.pages as f64;
+            let text = amount_text(done, goals.pages, "pages", |left| pages(left.ceil() as i64));
+            list.append(&goal_row(
+                "Reading",
+                &text,
+                done / goals.pages,
+                done >= goals.pages,
+                None,
+            ));
+        }
+        for status in &snap.habits {
+            let habit = &status.habit;
+            let mut text = habit.progress_text(status.today);
+            if let Some(streak) = status.streak_text() {
+                text.push_str(&format!("  ·  {streak}"));
+            }
+            list.append(&goal_row(
+                &habit.name,
+                &text,
+                habit.share(status.today),
+                status.done(),
+                Some(quick_log_button(status, &self.act).upcast()),
+            ));
+        }
+        for status in snap.projects.iter().filter(|p| p.project.has_goal()) {
+            list.append(&project_row(status, &project_summary(status)));
+        }
+        if list.first_child().is_none() {
+            list.append(&placeholder_row(
+                "No daily goals. Set minutes or pages with the pencil button, or add a habit.",
+            ));
+        }
         // Leave the spinners alone while they're being edited.
         if !self.goal_edit.is_active() {
             self.minutes_goal.set_value(goals.minutes);
             self.pages_goal.set_value(goals.pages);
         }
-        self.streak.set_label(&snap.streak.to_string());
-        self.best.set_label(&snap.best_streak.to_string());
+    }
 
-        let act = &self.act;
-        self.continue_list.remove_all();
+    /// The lecture and book to pick up, and the cards due.
+    fn update_next(&self, snap: &Snapshot) {
+        let (act, list) = (&self.act, &self.next_list);
+        list.remove_all();
         match snap.current_course() {
             Some(course) => {
                 let start = course.next.unwrap_or(0);
                 let lecture = &course.lectures[start];
                 let r = row(
-                    &lecture.title,
+                    short_title(&lecture.title, &course.name),
                     &format!(
                         "{}  ·  {}",
                         isolate(&course.name),
@@ -189,14 +202,12 @@ impl TodayPage {
                     course_key: key.clone(),
                     start,
                 }));
-                self.continue_list.append(&r);
+                list.append(&r);
             }
-            None if snap.courses.is_empty() => self.continue_list.append(&placeholder_row(
+            None if snap.courses.is_empty() => list.append(&placeholder_row(
                 "No courses yet. Add a folder of lectures to one of your video folders.",
             )),
-            None => self
-                .continue_list
-                .append(&placeholder_row("Every course is finished.")),
+            None => list.append(&placeholder_row("Every course is finished.")),
         }
         if let Some(book) = snap.last_book() {
             let r = row(&book.title, &item_status(book));
@@ -211,22 +222,23 @@ impl TodayPage {
                 move || Action::Note(id),
             ));
             r.add_suffix(&pill_button("Read", act, move || Action::Read(id)));
-            self.continue_list.append(&r);
+            list.append(&r);
         }
-
-        self.projects_list.remove_all();
-        let active: Vec<_> = snap
-            .projects
-            .iter()
-            .filter(|p| p.project.has_goal() || p.today > 0)
-            .collect();
-        self.projects_box.set_visible(!active.is_empty());
-        for status in active {
-            self.projects_list
-                .append(&project_row(status, &project_summary(status)));
+        if snap.cards_due > 0 {
+            let r = row(
+                &format!("{} due", cards(snap.cards_due as i64)),
+                &format!("{} in your notes", cards(snap.cards_total as i64)),
+            );
+            r.add_prefix(&gtk::Image::from_icon_name("dialog-question-symbolic"));
+            r.add_suffix(&pill_button("Review", act, || Action::Review));
+            list.append(&r);
         }
+    }
 
-        self.plan_list.remove_all();
+    /// Each course with a deadline: today's share of it and whether it's on track.
+    fn update_plan(&self, snap: &Snapshot) {
+        let (act, list) = (&self.act, &self.plan_list);
+        list.remove_all();
         let plan = snap.plan();
         self.plan_box.set_visible(!plan.is_empty());
         for course in plan {
@@ -253,9 +265,7 @@ impl TodayPage {
                 .join("  ·  ");
             let r = row(&course.name, &subtitle);
             r.set_subtitle_lines(2);
-            if share >= 1.0 {
-                r.add_prefix(&gtk::Image::from_icon_name("object-select-symbolic"));
-            }
+            r.add_prefix(&done_mark(share >= 1.0));
             r.add_suffix(&progress(share, 90));
             if let Some(start) = course.next {
                 let key = course.key.clone();
@@ -264,97 +274,121 @@ impl TodayPage {
                     start,
                 }));
             }
-            self.plan_list.append(&r);
+            list.append(&r);
         }
+    }
 
-        self.review_list.remove_all();
-        self.review_box.set_visible(snap.cards_total > 0);
-        let r = if snap.cards_due > 0 {
-            let r = row(
-                &format!(
-                    "{} card{} due",
-                    snap.cards_due,
-                    if snap.cards_due == 1 { "" } else { "s" }
-                ),
-                &format!(
-                    "{} cards in your notes  ·  {} reviewed today",
-                    snap.cards_total, snap.reviewed_today
-                ),
-            );
-            r.add_suffix(&pill_button("Review", act, || Action::Review));
-            r
-        } else {
-            row(
-                "All caught up",
-                &format!(
-                    "{} cards in your notes  ·  {} reviewed today",
-                    snap.cards_total, snap.reviewed_today
-                ),
-            )
-        };
-        r.add_prefix(&gtk::Image::from_icon_name("dialog-question-symbolic"));
-        self.review_list.append(&r);
-
-        self.today_list.remove_all();
-        if snap.today_entries.is_empty() {
-            self.today_list
-                .append(&placeholder_row("Nothing yet today."));
+    /// What was watched, read, committed and reviewed today, with the totals in the heading.
+    fn update_done(&self, snap: &Snapshot) {
+        let studied = snap.studied_today();
+        let mut totals = Vec::new();
+        if studied.minutes > 0.0 {
+            totals.push(fmt_duration(studied.minutes * 60.0));
         }
+        if studied.pages > 0 {
+            totals.push(pages(studied.pages));
+        }
+        // Not `studied.commits`, which counts projects no longer on disk too.
+        let commits: i64 = snap.projects.iter().map(|p| p.today).sum();
+        if commits > 0 {
+            totals.push(projects::count(commits));
+        }
+        self.totals.set_label(&totals.join("  ·  "));
+
+        let list = &self.done_list;
+        list.remove_all();
         for e in &snap.today_entries {
-            let r = row(&e.item.title, &e.item.course);
-            let amount = match e.item.kind {
-                Kind::Video => fmt_duration(e.seconds),
-                Kind::Book => format!("{} pages", e.pages),
+            let (icon, amount) = match e.item.kind {
+                Kind::Video => ("video-x-generic-symbolic", fmt_duration(e.seconds)),
+                Kind::Book => ("accessories-dictionary-symbolic", pages(e.pages)),
             };
+            let r = row(short_title(&e.item.title, &e.item.course), &e.item.course);
+            r.add_prefix(&gtk::Image::from_icon_name(icon));
             r.add_suffix(&value_label(&amount, &["numeric"]));
-            r.add_suffix(&done_check(e.item.id, e.item.is_done(), act));
-            self.today_list.append(&r);
+            r.add_suffix(&done_check(e.item.id, e.item.is_done(), &self.act));
+            list.append(&r);
+        }
+        for status in snap.projects.iter().filter(|p| p.today > 0) {
+            let r = row(&status.project.name, "");
+            r.add_prefix(&gtk::Image::from_icon_name(
+                "applications-engineering-symbolic",
+            ));
+            r.add_suffix(&value_label(&projects::count(status.today), &["numeric"]));
+            list.append(&r);
+        }
+        if snap.reviewed_today > 0 {
+            let r = row("Card review", "");
+            r.add_prefix(&gtk::Image::from_icon_name("dialog-question-symbolic"));
+            r.add_suffix(&value_label(&cards(snap.reviewed_today), &["numeric"]));
+            list.append(&r);
+        }
+        if list.first_child().is_none() {
+            list.append(&placeholder_row("Nothing yet today."));
         }
     }
 }
 
-/// Progress toward one daily goal: "32 / 45 min", a bar, and what's left.
-struct GoalMeter {
-    root: gtk::Box,
-    value: gtk::Label,
-    level: gtk::LevelBar,
-    left: gtk::Label,
+/// A goal: a check once it's met, the amount under the name, then `extra` and a bar.
+fn goal_row(
+    title: &str,
+    subtitle: &str,
+    share: f64,
+    done: bool,
+    extra: Option<gtk::Widget>,
+) -> adw::ActionRow {
+    let r = row(title, subtitle);
+    r.set_subtitle_lines(2);
+    r.add_prefix(&done_mark(done));
+    if let Some(extra) = extra {
+        r.add_suffix(&extra);
+    }
+    r.add_suffix(&progress(share, 90));
+    r
 }
 
-impl GoalMeter {
-    /// Hidden when `goal` is 0; `to_go` words the amount still missing.
-    fn set(&self, done: f64, goal: f64, unit: &str, to_go: impl Fn(f64) -> String) {
-        self.root.set_visible(goal > 0.0);
-        if goal <= 0.0 {
-            return;
-        }
-        self.value
-            .set_label(&format!("{done:.0} / {goal:.0} {unit}"));
-        self.level.set_value((done / goal).min(1.0));
-        self.left.set_label(&if done >= goal {
-            "Done".to_owned()
-        } else {
-            to_go(goal - done)
-        });
+/// "95 of 120 min", then what's left: "  ·  25m to go".
+fn amount_text(done: f64, goal: f64, unit: &str, left: impl Fn(f64) -> String) -> String {
+    let mut text = format!("{done:.0} of {goal:.0} {unit}");
+    if done < goal {
+        text.push_str(&format!("  ·  {} to go", left(goal - done)));
+    }
+    text
+}
+
+/// Adds one time to a count habit, or completes a minutes habit (hidden once it's done).
+fn quick_log_button(status: &HabitStatus, act: &Act) -> gtk::Button {
+    let habit = &status.habit;
+    let (text, tooltip) = match habit.unit {
+        Unit::Count => ("+1", "Add 1 time".to_owned()),
+        Unit::Minutes => (
+            "Mark Done",
+            format!("Log {}", habit.unit.amount(habit.goal)),
+        ),
+    };
+    let button = gtk::Button::builder()
+        .label(text)
+        .tooltip_text(tooltip)
+        .valign(gtk::Align::Center)
+        .visible(habit.unit == Unit::Count || !status.done())
+        .build();
+    let (act, id) = (act.clone(), habit.id);
+    button.connect_clicked(move |_| act(Action::QuickLogHabit(id)));
+    button
+}
+
+fn pages(n: i64) -> String {
+    if n == 1 {
+        "1 page".to_owned()
+    } else {
+        format!("{n} pages")
     }
 }
 
-fn goal_meter(caption: &str) -> GoalMeter {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    let value = value_label("", &["big-number", "numeric"]);
-    value.set_halign(gtk::Align::Start);
-    let level = gtk::LevelBar::for_interval(0.0, 1.0);
-    level.add_css_class("goal");
-    let left = label("", &["dim-label"]);
-    root.append(&label(caption, &["heading"]));
-    root.append(&value);
-    root.append(&level);
-    root.append(&left);
-    GoalMeter {
-        root,
-        value,
-        level,
-        left,
+fn cards(n: i64) -> String {
+    if n == 1 {
+        "1 card".to_owned()
+    } else {
+        format!("{n} cards")
     }
 }
 
@@ -377,7 +411,7 @@ fn goal_editor(act: &Act) -> (gtk::MenuButton, adw::SpinRow, adw::SpinRow) {
     content.append(&label("Daily goals", &["heading"]));
     content.append(&list);
     content.append(&label(
-        "Card review counts as video time. 0 turns a goal off.",
+        "Card review counts as video time. 0 turns a goal off. Habits and projects have their goals on their own pages.",
         &["dim-label", "caption"],
     ));
     let popover = gtk::Popover::builder().child(&content).build();
@@ -394,20 +428,10 @@ fn goal_editor(act: &Act) -> (gtk::MenuButton, adw::SpinRow, adw::SpinRow) {
 
     let button = gtk::MenuButton::builder()
         .icon_name("document-edit-symbolic")
-        .tooltip_text("Change daily goals")
+        .tooltip_text("Change the minutes and pages goals")
         .valign(gtk::Align::Center)
         .popover(&popover)
         .build();
     button.add_css_class("flat");
     (button, minutes, pages)
-}
-
-fn stat_card(caption: &str) -> (gtk::Box, gtk::Label) {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    card.add_css_class("card");
-    card.add_css_class("stat-card");
-    let value = label("0", &["big-number", "numeric"]);
-    card.append(&value);
-    card.append(&label(caption, &["dim-label", "caption"]));
-    (card, value)
 }

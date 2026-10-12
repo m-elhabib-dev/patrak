@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{Datelike, Duration, NaiveDate};
 use patrak::Session;
 use patrak::db::{self, Item, Kind};
-use patrak::habits::{self, Habit, HabitStatus, Unit};
+use patrak::habits::{self, Habit, HabitStatus};
 use patrak::progress::{Course, Day, Snapshot, fmt_clock, fmt_duration, item_status};
 use patrak::projects::{self, ProjectStatus};
 use patrak::review::{self, Card, Grade};
@@ -325,10 +325,7 @@ pub fn habit(query: String, amount: Option<String>) -> Result<()> {
 /// by one and a minutes habit is completed.
 fn parse_amount(arg: Option<&str>, current: i64, habit: &Habit) -> Result<i64> {
     let Some(arg) = arg.map(str::trim) else {
-        return Ok(match habit.unit {
-            Unit::Count => current + 1,
-            Unit::Minutes => current.max(habit.goal),
-        });
+        return Ok(habit.quick_amount(current));
     };
     let number = |s: &str| {
         s.parse::<i64>()
@@ -960,6 +957,7 @@ fn after_launch(session: &mut Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use patrak::habits::Unit;
 
     #[test]
     fn reads_deadlines() {

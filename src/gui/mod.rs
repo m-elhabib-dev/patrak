@@ -61,6 +61,8 @@ pub enum Action {
         id: i64,
         amount: i64,
     },
+    /// Add one time to a habit, or complete a minutes habit.
+    QuickLogHabit(i64),
     NewHabit,
     EditHabit(i64),
     /// Change a project's daily goal.
@@ -85,7 +87,6 @@ const CSS: &str = "
 .heat-4 { background-color: @success_bg_color; }
 .heat-holiday { background-color: @purple_3; }
 .holiday-pill { background-color: @purple_3; color: white; border-radius: 999px; padding: 2px 10px; font-weight: bold; }
-.big-number { font-size: 2.6em; font-weight: 800; }
 .stat-card { padding: 14px 18px; }
 levelbar.goal block { min-height: 14px; border-radius: 7px; }
 ";
@@ -274,11 +275,6 @@ impl App {
             narrow.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
             narrow.add_setter(&switcher, "visible", Some(&false.to_value()));
             narrow.add_setter(&courses.root, "collapsed", Some(&true.to_value()));
-            narrow.add_setter(
-                &today.meters,
-                "orientation",
-                Some(&gtk::Orientation::Vertical.to_value()),
-            );
             window.add_breakpoint(narrow);
 
             App {
@@ -441,6 +437,17 @@ impl App {
             Action::LogHabit { id, amount } => {
                 let result = db::open(&self.paths.db())
                     .and_then(|conn| patrak::habits::set_amount(&conn, id, snap.today, amount));
+                match result {
+                    Ok(()) => self.refresh(),
+                    Err(e) => self.toast(&format!("Couldn't log the habit: {e:#}")),
+                }
+            }
+            Action::QuickLogHabit(id) => {
+                let Some(h) = snap.habits.iter().find(|h| h.habit.id == id) else {
+                    return;
+                };
+                let result = db::open(&self.paths.db())
+                    .and_then(|conn| patrak::habits::quick_log(&conn, &h.habit, snap.today));
                 match result {
                     Ok(()) => self.refresh(),
                     Err(e) => self.toast(&format!("Couldn't log the habit: {e:#}")),

@@ -58,9 +58,10 @@ previous day.
 There are two daily goals: minutes of video (`daily_goal_minutes`, 60 by default) and book pages
 (`daily_goal_pages`, 20 by default).
 
-- Change them with the pencil button on the Today page, or in Preferences.
+- Change them with the pencil button next to **Goals** on the Today page, or in Preferences.
 - Card review time counts toward the minutes goal.
-- Each [habit](#habits), and each [project](#projects) with a goal, is a goal too.
+- Each [habit](#habits), and each [project](#projects) with a goal, is a goal too. The Today page
+  lists every goal in one place, with how many are done.
 - A day counts toward your streak, and shows green in the heatmap, only when every goal is met.
 - Set a goal to 0 to turn it off, for example to track only videos.
 - On a [holiday](#holidays) every goal is off.
@@ -70,7 +71,8 @@ There are two daily goals: minutes of video (`daily_goal_minutes`, 60 by default
 Track anything else you do every day on the **Habits** page, for example running 30 minutes or
 eating three times. Use **New Habit** to give one a name, a unit (times or minutes) and a daily goal.
 
-- Set today's amount with − and +, or type it in.
+- Set today's amount with − and +, or type it in. On the Today page, **+1** adds one time and
+  **Mark Done** completes a minutes habit.
 - Each habit shows its own streak.
 - Habits are part of the daily goal. A day keeps your streak only when every habit is done too, and
   the evening reminder lists the ones still missing.
@@ -135,9 +137,9 @@ Give a course a deadline in its **Plan** row (Courses page) or with `patrak dead
 - patrak works out how much you need to watch each day to finish on time.
 - It compares that with your recent pace (averaged over up to 14 days) and marks the course
   *on track*, *behind* or *overdue*.
-- **Today's plan** lists each course's share for today.
-- `patrak play` with no course name, and the Continue card, pick the course furthest behind on
-  today's share.
+- **Deadlines** on the Today page lists each course's share for today.
+- `patrak play` with no course name, and **Up Next** on the Today page, pick the course furthest
+  behind on today's share.
 
 ## Courses from YouTube
 

@@ -28,13 +28,26 @@ pub fn page(max_width: i32) -> (gtk::ScrolledWindow, gtk::Box) {
 
 /// A heading above a boxed list; returns (container, list).
 pub fn section(title: &str) -> (gtk::Box, gtk::ListBox) {
-    let container = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    boxed_list_below(&label(title, &["heading"]))
+}
+
+/// A section with `extra` at the end of the heading's line.
+pub fn section_with(title: &str, extra: &impl IsA<gtk::Widget>) -> (gtk::Box, gtk::ListBox) {
     let heading = label(title, &["heading"]);
+    heading.set_hexpand(true);
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header.append(&heading);
+    header.append(extra);
+    boxed_list_below(&header)
+}
+
+fn boxed_list_below(header: &impl IsA<gtk::Widget>) -> (gtk::Box, gtk::ListBox) {
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .build();
     list.add_css_class("boxed-list");
-    container.append(&heading);
+    container.append(header);
     container.append(&list);
     (container, list)
 }
@@ -130,6 +143,15 @@ pub fn done_check(item_id: i64, done: bool, act: &Act) -> gtk::CheckButton {
     let act = act.clone();
     check.connect_toggled(move |c| act(Action::SetDone(item_id, c.is_active())));
     check
+}
+
+/// A green check for a goal met today; invisible but still taking its place when not.
+pub fn done_mark(done: bool) -> gtk::Image {
+    let mark = gtk::Image::from_icon_name("object-select-symbolic");
+    mark.add_css_class("success");
+    mark.set_opacity(if done { 1.0 } else { 0.0 });
+    mark.set_tooltip_text(done.then_some("Done for today"));
+    mark
 }
 
 pub fn progress(fraction: f64, width: i32) -> gtk::ProgressBar {

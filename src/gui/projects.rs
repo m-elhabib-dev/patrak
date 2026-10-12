@@ -1,4 +1,4 @@
-use super::widgets::{icon_button, isolate, label, page, progress, row, section};
+use super::widgets::{done_mark, icon_button, isolate, label, page, progress, row, section};
 use super::{Act, Action, App};
 use adw::prelude::*;
 use chrono::NaiveDate;
@@ -69,11 +69,7 @@ impl ProjectsPage {
 pub fn project_row(status: &ProjectStatus, subtitle: &str) -> adw::ActionRow {
     let r = row(&status.project.name, subtitle);
     r.set_subtitle_lines(2);
-    let done = gtk::Image::from_icon_name("object-select-symbolic");
-    done.add_css_class("success");
-    done.set_opacity(if status.done() { 1.0 } else { 0.0 });
-    done.set_tooltip_text(status.done().then_some("Done for today"));
-    r.add_prefix(&done);
+    r.add_prefix(&done_mark(status.done()));
     if status.project.has_goal() {
         r.add_suffix(&progress(status.project.share(status.today), 90));
     }

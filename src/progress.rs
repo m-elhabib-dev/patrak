@@ -212,6 +212,21 @@ impl Goals {
     pub fn met(&self, day: Day) -> bool {
         self.progress(day) >= 1.0
     }
+
+    /// (goals met, goals on), counting the same goals as [`Goals::progress`].
+    pub fn tally(&self, day: Day) -> (u32, u32) {
+        let (mut met, mut total) = (
+            day.habits_met + day.projects_met,
+            day.habits_due + day.projects_due,
+        );
+        for (done, goal) in [(day.minutes, self.minutes), (day.pages as f64, self.pages)] {
+            if goal > 0.0 {
+                total += 1;
+                met += u32::from(done >= goal);
+            }
+        }
+        (met, total)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -675,6 +690,23 @@ pub fn fmt_duration(secs: f64) -> String {
     }
 }
 
+/// `title` without a leading course name: "Course ｜ Episode 5" becomes "Episode 5". Only
+/// strips the name when a separator follows it, and never leaves nothing.
+pub fn short_title<'a>(title: &'a str, course: &str) -> &'a str {
+    const SEPARATORS: &[char] = &['|', '｜', '-', '–', '—', ':', '·'];
+    let Some(rest) = title.strip_prefix(course) else {
+        return title;
+    };
+    let rest = rest.trim_start();
+    if course.is_empty() || !rest.starts_with(SEPARATORS) {
+        return title;
+    }
+    match rest.trim_start_matches(|c: char| c.is_whitespace() || SEPARATORS.contains(&c)) {
+        "" => title,
+        short => short,
+    }
+}
+
 /// "mm:ss", or "h:mm:ss" past an hour.
 pub fn fmt_clock(secs: f64) -> String {
     let secs = secs.max(0.0) as i64;
@@ -905,6 +937,24 @@ mod tests {
     }
 
     #[test]
+    fn tally_counts_each_goal_that_is_on() {
+        let both = Goals {
+            minutes: 60.0,
+            pages: 20.0,
+        };
+        let day = Day {
+            habits_due: 2,
+            habits_met: 1,
+            projects_due: 1,
+            projects_met: 1,
+            ..studied(60.0, 18)
+        };
+        assert_eq!(both.tally(day), (3, 5));
+        assert_eq!(MINUTES_ONLY.tally(day), (3, 4));
+        assert_eq!(MINUTES_ONLY.tally(Day::default()), (0, 1));
+    }
+
+    #[test]
     fn habits_gate_the_streak_from_the_day_they_were_added() {
         let conn = db::open_in_memory().unwrap();
         let cfg = Config {
@@ -1117,5 +1167,27 @@ mod tests {
         assert_eq!(fmt_duration(3900.0), "1h 05m");
         assert_eq!(fmt_clock(3062.4), "51:02");
         assert_eq!(fmt_clock(37205.0), "10:20:05");
+    }
+
+    #[test]
+    fn short_title_drops_a_leading_course_name() {
+        let course = "Distributed Systems بالعربي";
+        assert_eq!(
+            short_title("Distributed Systems بالعربي ｜ Episode 5 ｜ Clocks", course),
+            "Episode 5 ｜ Clocks"
+        );
+        assert_eq!(
+            short_title("Rust Book - 03: Ownership", "Rust Book"),
+            "03: Ownership"
+        );
+        // No separator after the name, or nothing after it: left alone.
+        assert_eq!(
+            short_title("Rust Book Advanced", "Rust Book"),
+            "Rust Book Advanced"
+        );
+        assert_eq!(short_title("Rust Book", "Rust Book"), "Rust Book");
+        assert_eq!(short_title("Rust Book |", "Rust Book"), "Rust Book |");
+        assert_eq!(short_title("Intro", "Rust Book"), "Intro");
+        assert_eq!(short_title("- Intro", ""), "- Intro");
     }
 }
