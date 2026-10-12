@@ -12,7 +12,7 @@ use anyhow::Result;
 use chrono::NaiveDate;
 use md5::{Digest, Md5};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -163,6 +163,7 @@ pub fn daily(conn: &Connection, cfg: &Config) -> Result<Vec<(NaiveDate, i64, i64
 pub fn statuses(
     projects: &[Project],
     logs: &[(NaiveDate, i64, i64)],
+    holidays: &BTreeSet<NaiveDate>,
     today: NaiveDate,
 ) -> Vec<ProjectStatus> {
     let mut out: Vec<ProjectStatus> = projects
@@ -174,7 +175,12 @@ pub fn statuses(
                 .map(|&(date, _, commits)| (date, commits))
                 .collect();
             let met = |d: NaiveDate| d >= p.added && counts.get(&d).is_some_and(|&c| p.met(c));
-            let (streak, best_streak) = progress::streaks_by(counts.keys().copied(), met, today);
+            let (streak, best_streak) = progress::streaks_by(
+                counts.keys().copied(),
+                met,
+                |d| holidays.contains(&d),
+                today,
+            );
             ProjectStatus {
                 project: p.clone(),
                 today: counts.get(&today).copied().unwrap_or(0),
@@ -423,7 +429,12 @@ mod tests {
             (day(1), 1, 3),
             (today, 1, 1),
         ];
-        let s = &statuses(std::slice::from_ref(&project), &logs, today)[0];
+        let s = &statuses(
+            std::slice::from_ref(&project),
+            &logs,
+            &BTreeSet::new(),
+            today,
+        )[0];
         assert_eq!((s.today, s.total, s.streak, s.best_streak), (1, 11, 2, 2));
         assert_eq!(s.last_commit, Some(today));
         assert!(!s.done());

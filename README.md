@@ -63,6 +63,7 @@ There are two daily goals: minutes of video (`daily_goal_minutes`, 60 by default
 - Each [habit](#habits), and each [project](#projects) with a goal, is a goal too.
 - A day counts toward your streak, and shows green in the heatmap, only when every goal is met.
 - Set a goal to 0 to turn it off, for example to track only videos.
+- On a [holiday](#holidays) every goal is off.
 
 ## Habits
 
@@ -107,6 +108,23 @@ commits.
 ```sh
 patrak projects          # every project: today's commits, streak, last commit
 patrak project patrak 3  # set a project's daily goal; 0 turns it off
+```
+
+## Holidays
+
+There's no fixed schedule of days off. To make today a holiday, press the sun button in the header
+bar (or Ctrl+H), or run `patrak holiday`. Press it again to make today a study day again.
+
+- Every goal is off for the day: minutes, pages, habits and project commits. Anything you still
+  do is recorded as usual.
+- A holiday neither breaks your streak nor adds to it. With Monday met, Tuesday a holiday and
+  Wednesday met, the streak is 2 days. The same goes for each habit's and project's streak.
+- Holidays show purple in the heatmap, and the evening reminder stays quiet.
+- Only today can be made a holiday.
+
+```sh
+patrak holiday           # toggle today
+patrak holiday on        # or off
 ```
 
 ## Deadlines
@@ -190,6 +208,7 @@ patrak habits            today's habits against their goals
 patrak habit <h> [n]     log a habit: n sets today's amount, +n or -n changes it
 patrak projects          git projects: today's commits against each goal
 patrak project <p> [n]   show a project, or set its daily goal in commits
+patrak holiday [on|off]  make today a holiday (goals off, streak kept), or toggle it
 patrak stats             heatmap, streaks, weekly totals
 patrak sync -v           rescan and show what changed
 ```

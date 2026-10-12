@@ -57,7 +57,7 @@ impl StatsPage {
             .build();
         heat_box.append(&heat_scroller);
         heat_box.append(&label(
-            "Brighter is closer to the daily goals; green means they were all met.",
+            "Brighter is closer to the daily goals; green means they were all met, and purple marks a holiday.",
             &["dim-label", "caption"],
         ));
         content.append(&heat_box);
@@ -122,13 +122,21 @@ impl StatsPage {
                 let cell = gtk::Box::new(gtk::Orientation::Horizontal, 0);
                 cell.add_css_class("heat");
                 if date <= snap.today {
-                    cell.add_css_class(&format!("heat-{}", snap.heat_level(date)));
+                    let holiday = snap.is_holiday(date);
+                    cell.add_css_class(&if holiday {
+                        "heat-holiday".to_owned()
+                    } else {
+                        format!("heat-{}", snap.heat_level(date))
+                    });
                     let studied = snap.studied_on(date);
                     let mut parts = vec![
                         date.format("%a %-d %b").to_string(),
                         format!("{:.0} min", studied.minutes),
                         format!("{} pages", studied.pages),
                     ];
+                    if holiday {
+                        parts.insert(1, "Holiday".to_owned());
+                    }
                     if studied.commits > 0 {
                         parts.push(projects::count(studied.commits));
                     }

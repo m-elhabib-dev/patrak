@@ -5,7 +5,7 @@ use crate::progress;
 use anyhow::{Result, bail};
 use chrono::NaiveDate;
 use rusqlite::{Connection, ErrorCode, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
@@ -198,6 +198,7 @@ pub fn daily(conn: &Connection) -> Result<Vec<(NaiveDate, i64, i64)>> {
 pub fn statuses(
     habits: &[Habit],
     logs: &[(NaiveDate, i64, i64)],
+    holidays: &BTreeSet<NaiveDate>,
     today: NaiveDate,
 ) -> Vec<HabitStatus> {
     habits
@@ -209,7 +210,12 @@ pub fn statuses(
                 .map(|&(date, _, amount)| (date, amount))
                 .collect();
             let met = |d: NaiveDate| d >= h.created && amounts.get(&d).is_some_and(|&a| h.met(a));
-            let (streak, best_streak) = progress::streaks_by(amounts.keys().copied(), met, today);
+            let (streak, best_streak) = progress::streaks_by(
+                amounts.keys().copied(),
+                met,
+                |d| holidays.contains(&d),
+                today,
+            );
             HabitStatus {
                 habit: h.clone(),
                 today: amounts.get(&today).copied().unwrap_or(0),
@@ -300,7 +306,7 @@ mod tests {
             (day(1), 1, 3),
             (today, 1, 2),
         ];
-        let s = &statuses(std::slice::from_ref(&habit), &logs, today)[0];
+        let s = &statuses(std::slice::from_ref(&habit), &logs, &BTreeSet::new(), today)[0];
         assert_eq!((s.today, s.streak, s.best_streak), (2, 1, 3));
         assert!(!s.done());
         assert_eq!(s.streak_text().as_deref(), Some("1-day streak, best 3"));

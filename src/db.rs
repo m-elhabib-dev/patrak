@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +174,13 @@ CREATE TABLE project_commits (
 );
 ";
 
+/// Version 5: holidays, days whose goals are off and that neither break nor extend a streak.
+const SCHEMA_V5: &str = "
+CREATE TABLE holidays (
+    date TEXT PRIMARY KEY
+);
+";
+
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -211,6 +218,11 @@ fn init(conn: &Connection) -> Result<()> {
     if version < 4 {
         conn.execute_batch(&format!(
             "BEGIN; {SCHEMA_V4} PRAGMA user_version = 4; COMMIT;"
+        ))?;
+    }
+    if version < 5 {
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V5} PRAGMA user_version = 5; COMMIT;"
         ))?;
     }
     Ok(())
@@ -450,5 +462,30 @@ pub fn set_deadline(
             [course_key],
         )?,
     };
+    Ok(())
+}
+
+pub fn holidays(conn: &Connection) -> Result<BTreeSet<NaiveDate>> {
+    let mut stmt = conn.prepare("SELECT date FROM holidays")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = BTreeSet::new();
+    for row in rows {
+        if let Ok(date) = NaiveDate::parse_from_str(&row?, "%Y-%m-%d") {
+            out.insert(date);
+        }
+    }
+    Ok(out)
+}
+
+/// Makes `date` a holiday, or a study day again.
+pub fn set_holiday(conn: &Connection, date: NaiveDate, on: bool) -> Result<()> {
+    if on {
+        conn.execute(
+            "INSERT OR IGNORE INTO holidays (date) VALUES (?1)",
+            [date.to_string()],
+        )?;
+    } else {
+        conn.execute("DELETE FROM holidays WHERE date = ?1", [date.to_string()])?;
+    }
     Ok(())
 }

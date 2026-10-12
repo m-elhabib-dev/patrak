@@ -15,6 +15,8 @@ pub struct HabitsPage {
 
 struct Inner {
     root: gtk::Stack,
+    /// Shown on a holiday.
+    holiday: gtk::Label,
     list: gtk::ListBox,
     rows: RefCell<Vec<HabitRow>>,
     /// The day and habits the rows were built for.
@@ -69,12 +71,19 @@ impl HabitsPage {
         header.append(&heading);
         header.append(&add);
 
+        let holiday = label(
+            "Today is a holiday: habits are optional and don’t affect your streaks.",
+            &["dim-label"],
+        );
+        holiday.set_visible(false);
+
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .build();
         list.add_css_class("boxed-list");
         let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
         section.append(&header);
+        section.append(&holiday);
         section.append(&list);
         section.append(&label(
             "Habits are part of the daily goal: a day keeps your streak only when every habit is done too. Use − and + or type today’s amount.",
@@ -98,6 +107,7 @@ impl HabitsPage {
 
         let inner = Rc::new(Inner {
             root: root.clone(),
+            holiday,
             list,
             rows: RefCell::new(Vec::new()),
             built_for: RefCell::new(None),
@@ -117,6 +127,7 @@ impl HabitsPage {
             } else {
                 "habits"
             });
+        inner.holiday.set_visible(snap.holiday_today());
         // Rebuilding would wipe a number being typed, so rows are only rebuilt when the
         // habits themselves or the day change.
         let key = (

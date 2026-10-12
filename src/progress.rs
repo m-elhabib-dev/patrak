@@ -138,7 +138,7 @@ pub struct Day {
     /// Lectures watched plus cards reviewed.
     pub minutes: f64,
     pub pages: i64,
-    /// Habits that counted this day (those added by then).
+    /// Habits that counted this day (those added by then; none on a holiday).
     pub habits_due: u32,
     /// Habits whose goal was reached.
     pub habits_met: u32,
@@ -146,7 +146,8 @@ pub struct Day {
     pub habits_share: f64,
     /// Commits in every project, with a goal or not.
     pub commits: i64,
-    /// Projects whose goal counted this day (those with a goal, found by then).
+    /// Projects whose goal counted this day (those with a goal, found by then; none on a
+    /// holiday).
     pub projects_due: u32,
     /// Projects whose goal was reached.
     pub projects_met: u32,
@@ -218,6 +219,8 @@ pub struct Snapshot {
     pub today: NaiveDate,
     pub goals: Goals,
     pub days: BTreeMap<NaiveDate, Day>,
+    /// Days whose goals are off; they neither break nor extend a streak.
+    pub holidays: BTreeSet<NaiveDate>,
     pub today_entries: Vec<TodayEntry>,
     pub streak: usize,
     pub best_streak: usize,
@@ -241,6 +244,14 @@ impl Snapshot {
 
     pub fn studied_on(&self, day: NaiveDate) -> Day {
         self.days.get(&day).copied().unwrap_or_default()
+    }
+
+    pub fn is_holiday(&self, day: NaiveDate) -> bool {
+        self.holidays.contains(&day)
+    }
+
+    pub fn holiday_today(&self) -> bool {
+        self.is_holiday(self.today)
     }
 
     /// The course to continue: the deadline course needing the most today if any is short of
@@ -427,6 +438,7 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
     }
     let (cards_due, cards_total) = review::counts(conn, today)?;
     let deadlines = db::deadlines(conn)?;
+    let holidays = db::holidays(conn)?;
 
     let habit_list = habits::list(conn)?;
     let habit_logs = habits::daily(conn)?;
@@ -449,7 +461,8 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
         let mut dates: BTreeSet<NaiveDate> = days.keys().copied().collect();
         dates.extend(habit_logs.iter().map(|l| l.0));
         dates.insert(today);
-        for date in dates {
+        // A holiday has no goals.
+        for date in dates.into_iter().filter(|d| !holidays.contains(d)) {
             let day = days.entry(date).or_default();
             for habit in habit_list.iter().filter(|h| h.created <= date) {
                 let amount = amounts.get(&(date, habit.id)).copied().unwrap_or(0);
@@ -465,8 +478,8 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
             }
         }
     }
-    let habits = habits::statuses(&habit_list, &habit_logs, today);
-    let projects = projects::statuses(&project_list, &commit_logs, today);
+    let habits = habits::statuses(&habit_list, &habit_logs, &holidays, today);
+    let projects = projects::statuses(&project_list, &commit_logs, &holidays, today);
 
     let mut grouped: BTreeMap<&str, Vec<&Item>> = BTreeMap::new();
     for item in items.iter().filter(|i| i.kind == Kind::Video) {
@@ -504,11 +517,12 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
     let mut books: Vec<Item> = items.into_iter().filter(|i| i.kind == Kind::Book).collect();
     books.sort_by(|a, b| touched(b).cmp(&touched(a)).then(a.ord.cmp(&b.ord)));
 
-    let (streak, best_streak) = streaks(&days, goals, today);
+    let (streak, best_streak) = streaks(&days, goals, &holidays, today);
     Ok(Snapshot {
         today,
         goals,
         days,
+        holidays,
         today_entries,
         streak,
         best_streak,
@@ -575,30 +589,43 @@ fn next_lecture(lectures: &[Item]) -> Option<usize> {
 }
 
 /// (current, best) streaks of days that met the goals.
-pub fn streaks(days: &BTreeMap<NaiveDate, Day>, goals: Goals, today: NaiveDate) -> (usize, usize) {
+pub fn streaks(
+    days: &BTreeMap<NaiveDate, Day>,
+    goals: Goals,
+    holidays: &BTreeSet<NaiveDate>,
+    today: NaiveDate,
+) -> (usize, usize) {
     streaks_by(
         days.keys().copied(),
         |d| days.get(&d).is_some_and(|&s| goals.met(s)),
+        |d| holidays.contains(&d),
         today,
     )
 }
 
 /// (current, best) streaks of days that `met` accepts; `days` lists, in order, every day that
-/// might be. Today only counts toward the current streak once it is met, so an unfinished
-/// today doesn't break a streak that ran through yesterday.
+/// might be. A holiday neither breaks a streak nor adds to it. Today only counts toward the
+/// current streak once it is met, so an unfinished today doesn't break a streak that ran
+/// through yesterday.
 pub fn streaks_by(
     days: impl IntoIterator<Item = NaiveDate>,
     met: impl Fn(NaiveDate) -> bool,
+    holiday: impl Fn(NaiveDate) -> bool,
     today: NaiveDate,
 ) -> (usize, usize) {
-    let mut day = if met(today) {
+    let counts = |d: NaiveDate| !holiday(d) && met(d);
+    let mut day = if counts(today) {
         today
     } else {
         today - Duration::days(1)
     };
     let mut current = 0;
-    while met(day) {
-        current += 1;
+    loop {
+        if counts(day) {
+            current += 1;
+        } else if !holiday(day) {
+            break;
+        }
         day -= Duration::days(1);
     }
 
@@ -606,14 +633,13 @@ pub fn streaks_by(
     let mut run = 0;
     let mut prev: Option<NaiveDate> = None;
     for d in days {
-        if !met(d) {
+        if !counts(d) {
             continue;
         }
-        run = if prev == Some(d - Duration::days(1)) {
-            run + 1
-        } else {
-            1
-        };
+        // Joined to the previous day counted when only holidays lie between them.
+        let joined =
+            prev.is_some_and(|p| (1..(d - p).num_days()).all(|i| holiday(p + Duration::days(i))));
+        run = if joined { run + 1 } else { 1 };
         best = best.max(run);
         prev = Some(d);
     }
@@ -728,10 +754,11 @@ mod tests {
         ] {
             m.insert(d(day), studied(mins, 0));
         }
-        assert_eq!(streaks(&m, MINUTES_ONLY, d("2026-10-11")), (3, 3));
+        let none = BTreeSet::new();
+        assert_eq!(streaks(&m, MINUTES_ONLY, &none, d("2026-10-11")), (3, 3));
         m.insert(d("2026-10-11"), studied(61.0, 0));
-        assert_eq!(streaks(&m, MINUTES_ONLY, d("2026-10-11")), (4, 4));
-        assert_eq!(streaks(&m, MINUTES_ONLY, d("2026-10-13")), (0, 4));
+        assert_eq!(streaks(&m, MINUTES_ONLY, &none, d("2026-10-11")), (4, 4));
+        assert_eq!(streaks(&m, MINUTES_ONLY, &none, d("2026-10-13")), (0, 4));
     }
 
     #[test]
@@ -743,8 +770,85 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert(d("2026-10-09"), studied(60.0, 25));
         m.insert(d("2026-10-10"), studied(90.0, 5));
-        assert_eq!(streaks(&m, both, d("2026-10-11")), (0, 1));
-        assert_eq!(streaks(&m, MINUTES_ONLY, d("2026-10-11")), (2, 2));
+        let none = BTreeSet::new();
+        assert_eq!(streaks(&m, both, &none, d("2026-10-11")), (0, 1));
+        assert_eq!(streaks(&m, MINUTES_ONLY, &none, d("2026-10-11")), (2, 2));
+    }
+
+    #[test]
+    fn holidays_bridge_the_streak() {
+        let mut m = BTreeMap::new();
+        for day in ["2026-10-05", "2026-10-07", "2026-10-08", "2026-10-11"] {
+            m.insert(d(day), studied(60.0, 0));
+        }
+        let none = BTreeSet::new();
+        assert_eq!(streaks(&m, MINUTES_ONLY, &none, d("2026-10-11")), (1, 2));
+
+        // The 6th joins the 5th to the 7th; the 9th and 10th join the 8th to the 11th,
+        // without adding to the count.
+        let holidays: BTreeSet<NaiveDate> = ["2026-10-06", "2026-10-09", "2026-10-10"]
+            .into_iter()
+            .map(d)
+            .collect();
+        assert_eq!(
+            streaks(&m, MINUTES_ONLY, &holidays, d("2026-10-11")),
+            (4, 4)
+        );
+        // A holiday today keeps the streak that ran through yesterday.
+        let mut today_off = holidays.clone();
+        today_off.insert(d("2026-10-12"));
+        assert_eq!(
+            streaks(&m, MINUTES_ONLY, &today_off, d("2026-10-12")),
+            (4, 4)
+        );
+        // So does a run of holidays; a day that is neither still breaks it.
+        today_off.insert(d("2026-10-13"));
+        assert_eq!(
+            streaks(&m, MINUTES_ONLY, &today_off, d("2026-10-14")),
+            (4, 4)
+        );
+        assert_eq!(
+            streaks(&m, MINUTES_ONLY, &today_off, d("2026-10-15")),
+            (0, 4)
+        );
+        // Studying on a holiday doesn't add to the streak either.
+        m.insert(d("2026-10-06"), studied(90.0, 0));
+        assert_eq!(
+            streaks(&m, MINUTES_ONLY, &holidays, d("2026-10-11")),
+            (4, 4)
+        );
+    }
+
+    #[test]
+    fn a_holiday_turns_off_the_days_goals() {
+        let conn = db::open_in_memory().unwrap();
+        let cfg = Config {
+            daily_goal_minutes: 0,
+            daily_goal_pages: 0,
+            ..Config::default()
+        };
+        let today = cfg.today();
+        let day = |n: i64| today - Duration::days(n);
+        let eat = habits::add(&conn, "Eat", habits::Unit::Count, 3, day(3)).unwrap();
+        // Only one meal yesterday.
+        for (date, amount) in [(day(3), 3), (day(2), 3), (day(1), 1), (today, 3)] {
+            habits::set_amount(&conn, eat, date, amount).unwrap();
+        }
+        let snap = build(&conn, &cfg).unwrap();
+        assert_eq!((snap.streak, snap.best_streak), (1, 2));
+
+        db::set_holiday(&conn, day(1), true).unwrap();
+        db::set_holiday(&conn, day(1), true).unwrap();
+        let snap = build(&conn, &cfg).unwrap();
+        assert!(snap.is_holiday(day(1)) && !snap.holiday_today());
+        assert_eq!(snap.studied_on(day(1)).habits_due, 0);
+        assert_eq!((snap.streak, snap.best_streak), (3, 3));
+        assert_eq!((snap.habits[0].streak, snap.habits[0].best_streak), (3, 3));
+
+        db::set_holiday(&conn, day(1), false).unwrap();
+        let snap = build(&conn, &cfg).unwrap();
+        assert!(snap.holidays.is_empty());
+        assert_eq!(snap.streak, 1);
     }
 
     #[test]

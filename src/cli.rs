@@ -40,6 +40,10 @@ fn green(s: &str) -> String {
     paint("32", s)
 }
 
+fn purple(s: &str) -> String {
+    paint("35", s)
+}
+
 fn bar(fraction: f64, width: usize) -> String {
     let filled = ((fraction.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
     let done = "█".repeat(filled);
@@ -77,32 +81,45 @@ fn goal_part(done: f64, goal: f64, unit: &str) -> String {
 
 fn print_today(snap: &Snapshot) {
     let studied = snap.studied_today();
-    let habits = if snap.habits.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "   habits {}/{}",
-            bold(&studied.habits_met.to_string()),
-            studied.habits_due
-        )
-    };
-    let projects = if studied.projects_due > 0 {
-        format!(
-            "   projects {}/{}",
-            bold(&studied.projects_met.to_string()),
-            studied.projects_due
-        )
-    } else {
-        String::new()
-    };
-    println!(
-        "{}  {}   {}{habits}{projects}   streak {} (best {})",
-        bold(&snap.today.format("%a %d %b").to_string()),
-        goal_part(studied.minutes, snap.goals.minutes, "min"),
-        goal_part(studied.pages as f64, snap.goals.pages, "pages"),
+    let date = bold(&snap.today.format("%a %d %b").to_string());
+    let streak = format!(
+        "streak {} (best {})",
         bold(&snap.streak.to_string()),
-        snap.best_streak,
+        snap.best_streak
     );
+    if snap.holiday_today() {
+        // Goals are off: only what was done.
+        println!(
+            "{date}  {}   {}   {}   {streak}",
+            purple("holiday · goals off"),
+            goal_part(studied.minutes, 0.0, "min"),
+            goal_part(studied.pages as f64, 0.0, "pages"),
+        );
+    } else {
+        let habits = if snap.habits.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "   habits {}/{}",
+                bold(&studied.habits_met.to_string()),
+                studied.habits_due
+            )
+        };
+        let projects = if studied.projects_due > 0 {
+            format!(
+                "   projects {}/{}",
+                bold(&studied.projects_met.to_string()),
+                studied.projects_due
+            )
+        } else {
+            String::new()
+        };
+        println!(
+            "{date}  {}   {}{habits}{projects}   {streak}",
+            goal_part(studied.minutes, snap.goals.minutes, "min"),
+            goal_part(studied.pages as f64, snap.goals.pages, "pages"),
+        );
+    }
 
     if !snap.habits.is_empty() {
         println!("\n{}", bold("Habits"));
@@ -518,14 +535,20 @@ pub fn stats() -> Result<()> {
                 line.push(' ');
                 continue;
             }
-            let shade = ["238", "22", "28", "34", "40"][snap.heat_level(day) as usize];
+            let shade = if snap.is_holiday(day) {
+                "135"
+            } else {
+                ["238", "22", "28", "34", "40"][snap.heat_level(day) as usize]
+            };
             line.push_str(&paint(&format!("38;5;{shade}"), "■"));
         }
         println!("{line}");
     }
     println!(
-        "  {}",
-        dim("less ■ ■ ■ ■ ■ more   (full square = daily goals met)")
+        "  {}  {} {}",
+        dim("less ■ ■ ■ ■ ■ more   (full square = daily goals met)"),
+        paint("38;5;135", "■"),
+        dim("holiday")
     );
 
     println!("\n{}", bold("Weekly totals"));
@@ -586,7 +609,7 @@ pub fn sync(verbose: bool) -> Result<()> {
 pub fn remind() -> Result<()> {
     let (_, snap) = session()?;
     let (studied, goals) = (snap.studied_today(), snap.goals);
-    if goals.met(studied) {
+    if snap.holiday_today() || goals.met(studied) {
         return Ok(());
     }
     let mut short = Vec::new();
@@ -639,6 +662,19 @@ pub fn remind() -> Result<()> {
             let _ = Command::new(exe).spawn();
         }
     });
+    Ok(())
+}
+
+/// Makes today a holiday (`on`), a study day again (`off`), or toggles it.
+pub fn holiday(state: Option<String>) -> Result<()> {
+    let (session, snap) = session()?;
+    let on = match state.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        _ => !snap.holiday_today(),
+    };
+    db::set_holiday(&session.conn, snap.today, on)?;
+    print_today(&session.snapshot()?);
     Ok(())
 }
 

@@ -65,6 +65,8 @@ pub enum Action {
     EditHabit(i64),
     /// Change a project's daily goal.
     EditProject(i64),
+    /// Make today a holiday, or a study day again.
+    SetHoliday(bool),
     /// Look for new episodes of a downloaded course.
     CheckCourse(PathBuf),
     /// Download new episodes of a downloaded course.
@@ -81,9 +83,18 @@ const CSS: &str = "
 .heat-2 { background-color: alpha(@accent_bg_color, 0.55); }
 .heat-3 { background-color: alpha(@accent_bg_color, 0.85); }
 .heat-4 { background-color: @success_bg_color; }
+.heat-holiday { background-color: @purple_3; }
+.holiday-pill { background-color: @purple_3; color: white; border-radius: 999px; padding: 2px 10px; font-weight: bold; }
 .big-number { font-size: 2.6em; font-weight: 800; }
 .stat-card { padding: 14px 18px; }
 levelbar.goal block { min-height: 14px; border-radius: 7px; }
+";
+
+/// Loaded above the user's own gtk.css, whose `button:checked` would otherwise paint the
+/// holiday button in the theme's accent colour.
+const HOLIDAY_CSS: &str = "
+button.holiday:checked { background-color: @purple_3; color: white; }
+button.holiday:checked:hover { background-color: shade(@purple_3, 1.1); }
 ";
 
 /// Opens the window, showing `page` (today, courses, books, projects, habits or stats) if given.
@@ -92,14 +103,16 @@ pub fn run(page: Option<String>) {
         .application_id(setup::APP_ID)
         .build();
     app.connect_startup(|_| {
-        let css = gtk::CssProvider::new();
-        css.load_from_string(CSS);
-        if let Some(display) = gtk::gdk::Display::default() {
-            gtk::style_context_add_provider_for_display(
-                &display,
-                &css,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
+        let Some(display) = gtk::gdk::Display::default() else {
+            return;
+        };
+        for (css, priority) in [
+            (CSS, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION),
+            (HOLIDAY_CSS, gtk::STYLE_PROVIDER_PRIORITY_USER + 1),
+        ] {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_string(css);
+            gtk::style_context_add_provider_for_display(&display, &provider, priority);
         }
     });
     app.connect_activate(move |app| {
@@ -124,6 +137,8 @@ struct App {
     projects: projects::ProjectsPage,
     habits: habits::HabitsPage,
     stats: stats::StatsPage,
+    /// Whether today is a holiday; the header's toggle button follows its state.
+    holiday: gio::SimpleAction,
     paths: Paths,
     cfg: RefCell<Config>,
     snapshot: RefCell<Option<Rc<Snapshot>>>,
@@ -214,11 +229,20 @@ impl App {
                 .action_name("app.add-course")
                 .build();
 
+            let holiday = gio::SimpleAction::new_stateful("holiday", None, &false.to_variant());
+            let holiday_button = gtk::ToggleButton::builder()
+                .icon_name("weather-clear-symbolic")
+                .tooltip_text("Holiday: turn off today’s goals (Ctrl+H)")
+                .action_name("app.holiday")
+                .build();
+            holiday_button.add_css_class("holiday");
+
             let header = adw::HeaderBar::new();
             header.set_title_widget(Some(&switcher));
             header.pack_start(&add);
             header.pack_start(&refresh);
             header.pack_end(&menu_button);
+            header.pack_end(&holiday_button);
 
             let banner = adw::Banner::builder()
                 .title("Finish setup to track mpv watch time and get reminders")
@@ -268,6 +292,7 @@ impl App {
                 projects,
                 habits,
                 stats,
+                holiday,
                 paths,
                 cfg: RefCell::new(cfg),
                 snapshot: RefCell::new(None),
@@ -339,6 +364,16 @@ impl App {
         add("about", &[], |app| app.show_about());
         add("add-course", &["<Control>n"], download_dialog::show_add);
         add("quit", &["<Control>q"], |app| app.window.close());
+
+        let weak = Rc::downgrade(self);
+        self.holiday.connect_activate(move |action, _| {
+            let on = action.state().and_then(|s| s.get::<bool>()) == Some(true);
+            if let Some(app) = weak.upgrade() {
+                app.handle(Action::SetHoliday(!on));
+            }
+        });
+        gtk_app.add_action(&self.holiday);
+        gtk_app.set_accels_for_action("app.holiday", &["<Control>h"]);
     }
 
     fn handle(self: &Rc<Self>, action: Action) {
@@ -420,6 +455,23 @@ impl App {
             Action::EditProject(id) => {
                 if let Some(p) = snap.projects.iter().find(|p| p.project.id == id) {
                     projects::edit_goal(self, &p.project);
+                }
+            }
+            // The day on screen.
+            Action::SetHoliday(on) => {
+                let result = db::open(&self.paths.db())
+                    .and_then(|conn| db::set_holiday(&conn, snap.today, on));
+                match result {
+                    Ok(()) => {
+                        self.holiday.set_state(&on.to_variant());
+                        self.toast(if on {
+                            "Today is a holiday: goals are off and your streak is safe"
+                        } else {
+                            "Today is a study day again"
+                        });
+                        self.refresh();
+                    }
+                    Err(e) => self.toast(&format!("Couldn't change the holiday: {e:#}")),
                 }
             }
             Action::CheckCourse(dir) => self.check_sources(vec![dir], true),
@@ -513,6 +565,7 @@ impl App {
         self.projects.update(&snap);
         self.habits.update(&snap);
         self.stats.update(&snap);
+        self.holiday.set_state(&snap.holiday_today().to_variant());
         *self.snapshot.borrow_mut() = Some(snap.clone());
         self.check_stale_sources(&snap);
     }

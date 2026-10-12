@@ -71,6 +71,12 @@ enum Cmd {
         #[arg(allow_negative_numbers = true)]
         amount: Option<String>,
     },
+    /// Make today a holiday (goals off, streak kept) or a study day again; toggles with no
+    /// argument
+    Holiday {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
     /// Heatmap, streaks and weekly totals
     Stats,
     /// Rescan the library and pull progress from mpv and zathura
@@ -108,6 +114,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Project { name, goal }) => cli::project(name, goal),
         Some(Cmd::Habits) => cli::habits(),
         Some(Cmd::Habit { name, amount }) => cli::habit(name, amount),
+        Some(Cmd::Holiday { state }) => cli::holiday(state),
         Some(Cmd::Stats) => cli::stats(),
         Some(Cmd::Sync { verbose }) => cli::sync(verbose),
         Some(Cmd::Remind) => cli::remind(),

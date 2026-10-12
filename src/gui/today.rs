@@ -13,6 +13,8 @@ pub struct TodayPage {
     /// The two goal meters; the window stacks them when narrow.
     pub meters: gtk::Box,
     date: gtk::Label,
+    /// "Holiday", next to the date on a holiday.
+    holiday: gtk::Label,
     goal_edit: gtk::MenuButton,
     minutes_goal: adw::SpinRow,
     pages_goal: adw::SpinRow,
@@ -38,9 +40,12 @@ impl TodayPage {
 
         let date = label("", &["dim-label", "title-4"]);
         date.set_hexpand(true);
+        let holiday = value_label("Holiday", &["holiday-pill", "caption"]);
+        holiday.set_visible(false);
         let (goal_edit, minutes_goal, pages_goal) = goal_editor(&act);
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         header.append(&date);
+        header.append(&holiday);
         header.append(&goal_edit);
 
         let video_meter = goal_meter("Videos");
@@ -78,6 +83,7 @@ impl TodayPage {
             root,
             meters,
             date,
+            holiday,
             goal_edit,
             minutes_goal,
             pages_goal,
@@ -129,7 +135,14 @@ impl TodayPage {
             && goals.pages <= 0.0
             && snap.habits.is_empty()
             && !snap.projects.iter().any(|p| p.project.has_goal());
-        let summary = if no_goal {
+        // A holiday turns every goal off; what's done still shows, greyed out.
+        let holiday = snap.holiday_today();
+        self.holiday.set_visible(holiday);
+        self.meters.set_sensitive(!holiday);
+        self.projects_list.set_sensitive(!holiday);
+        let summary = if holiday {
+            Some("Holiday: today’s goals are off and your streak is safe.".to_owned())
+        } else if no_goal {
             Some("No daily goal set. Use the pencil button to set one.".to_owned())
         } else if goals.met(studied) {
             Some("Daily goal reached. Nice work!".to_owned())
