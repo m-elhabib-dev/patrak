@@ -5,6 +5,7 @@ pub mod habits;
 pub mod launch;
 pub mod library;
 pub mod progress;
+pub mod projects;
 pub mod review;
 pub mod setup;
 pub mod sources;

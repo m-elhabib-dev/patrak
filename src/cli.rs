@@ -4,6 +4,7 @@ use patrak::Session;
 use patrak::db::{self, Item, Kind};
 use patrak::habits::{self, Habit, HabitStatus, Unit};
 use patrak::progress::{Course, Day, Snapshot, fmt_clock, fmt_duration, item_status};
+use patrak::projects::{self, ProjectStatus};
 use patrak::review::{self, Card, Grade};
 use patrak::{config::Config, download, launch, setup, sync::set_done};
 use std::collections::VecDeque;
@@ -85,8 +86,17 @@ fn print_today(snap: &Snapshot) {
             studied.habits_due
         )
     };
+    let projects = if studied.projects_due > 0 {
+        format!(
+            "   projects {}/{}",
+            bold(&studied.projects_met.to_string()),
+            studied.projects_due
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "{}  {}   {}{habits}   streak {} (best {})",
+        "{}  {}   {}{habits}{projects}   streak {} (best {})",
         bold(&snap.today.format("%a %d %b").to_string()),
         goal_part(studied.minutes, snap.goals.minutes, "min"),
         goal_part(studied.pages as f64, snap.goals.pages, "pages"),
@@ -98,6 +108,18 @@ fn print_today(snap: &Snapshot) {
         println!("\n{}", bold("Habits"));
         for h in &snap.habits {
             print_habit(h);
+        }
+    }
+
+    let active: Vec<&ProjectStatus> = snap
+        .projects
+        .iter()
+        .filter(|p| p.project.has_goal() || p.today > 0)
+        .collect();
+    if !active.is_empty() {
+        println!("\n{}", bold("Projects"));
+        for p in active {
+            print_project(p);
         }
     }
 
@@ -181,6 +203,76 @@ fn print_habit(h: &HabitStatus) {
         ),
         bold(&h.habit.name)
     );
+}
+
+/// "████████████ 2 / 1 commit  patrak  · 4-day streak"
+fn print_project(p: &ProjectStatus) {
+    let streak = p
+        .streak_text()
+        .map(|s| dim(&format!("  · {s}")))
+        .unwrap_or_default();
+    let unit = projects::word(if p.project.has_goal() {
+        p.project.goal
+    } else {
+        p.today
+    });
+    println!(
+        "  {}  {}{streak}",
+        goal_part(p.today as f64, p.project.goal as f64, unit),
+        bold(&p.project.name)
+    );
+}
+
+/// "last commit Oct 11 · 128 commits in all · ~/patrak/Projects/patrak", dimmed.
+fn print_project_details(p: &ProjectStatus, today: NaiveDate) {
+    let mut parts = Vec::new();
+    if let Some(last) = p.last_commit.filter(|&d| d < today) {
+        parts.push(format!("last commit {}", last.format("%b %-d")));
+    }
+    if p.total > 0 {
+        parts.push(format!("{} in all", projects::count(p.total)));
+    }
+    if !p.project.has_goal() {
+        parts.push("no daily goal".into());
+    }
+    parts.push(p.project.path.display().to_string());
+    println!("    {}", dim(&parts.join("  ·  ")));
+}
+
+pub fn projects() -> Result<()> {
+    let (session, snap) = session()?;
+    if snap.projects.is_empty() {
+        println!(
+            "No projects yet. Put git repositories in {}.",
+            session.cfg.project_dirs.join(", ")
+        );
+    }
+    for p in &snap.projects {
+        print_project(p);
+        print_project_details(p, snap.today);
+    }
+    Ok(())
+}
+
+/// Shows a project, or sets its daily goal in commits (0 turns it off).
+pub fn project(query: String, goal: Option<u32>) -> Result<()> {
+    let (session, snap) = session()?;
+    let found = one(snap.find_projects(&query), "project", &query, |p| {
+        p.project.name.clone()
+    })?;
+    let id = found.project.id;
+    if let Some(goal) = goal {
+        projects::set_goal(&session.conn, id, goal.into())?;
+    }
+    let snap = session.snapshot()?;
+    let status = snap
+        .projects
+        .iter()
+        .find(|p| p.project.id == id)
+        .context("project vanished")?;
+    print_project(status);
+    print_project_details(status, snap.today);
+    Ok(())
 }
 
 pub fn habits() -> Result<()> {
@@ -449,8 +541,13 @@ pub fn stats() -> Result<()> {
         } else {
             String::new()
         };
+        let commits = if week.commits > 0 {
+            dim(&format!("  {}", projects::count(week.commits)))
+        } else {
+            String::new()
+        };
         println!(
-            "  {}  {} {:>5.0} min{pages}",
+            "  {}  {} {:>5.0} min{pages}{commits}",
             monday.format("%b %d"),
             bar(week.minutes / max, 30),
             week.minutes
@@ -460,11 +557,12 @@ pub fn stats() -> Result<()> {
     let total: Day = snap.days.values().copied().sum();
     let days = snap.days.values().filter(|d| !d.is_empty()).count();
     println!(
-        "\nstreak {}  ·  best {}  ·  {} studied, {} pages read over {days} days",
+        "\nstreak {}  ·  best {}  ·  {} studied, {} pages read, {} over {days} days",
         bold(&snap.streak.to_string()),
         snap.best_streak,
         fmt_duration(total.minutes * 60.0),
-        total.pages
+        total.pages,
+        projects::count(total.commits)
     );
     Ok(())
 }
@@ -506,6 +604,17 @@ pub fn remind() -> Result<()> {
             "{} {}",
             h.habit.name,
             h.habit.progress_text(h.today)
+        ));
+    }
+    for p in snap
+        .projects
+        .iter()
+        .filter(|p| p.project.has_goal() && !p.done())
+    {
+        short.push(format!(
+            "{} {}",
+            p.project.name,
+            p.project.progress_text(p.today)
         ));
     }
     let mut body = if short.is_empty() {
@@ -556,9 +665,10 @@ pub fn setup(force: bool) -> Result<()> {
         Err(e) => eprintln!("reminder timer not installed: {e:#}"),
     }
     println!(
-        "\nPut course folders in {} and books in {}.",
+        "\nPut course folders in {}, books in {} and git repositories in {}.",
         cfg.video_dirs.join(", "),
-        cfg.book_dirs.join(", ")
+        cfg.book_dirs.join(", "),
+        cfg.project_dirs.join(", ")
     );
     Ok(())
 }

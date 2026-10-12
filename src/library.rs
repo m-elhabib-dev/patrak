@@ -113,7 +113,7 @@ fn scanned(
     })
 }
 
-fn is_hidden(p: &Path) -> bool {
+pub(crate) fn is_hidden(p: &Path) -> bool {
     file_name(p).starts_with('.')
 }
 
@@ -136,7 +136,7 @@ fn has_ext(p: &Path, exts: &[&str]) -> bool {
             .is_some_and(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
-fn file_name(p: &Path) -> String {
+pub(crate) fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()

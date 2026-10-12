@@ -1,3 +1,4 @@
+use super::projects::{project_row, summary as project_summary};
 use super::widgets::{
     done_check, icon_button, isolate, label, page, pill_button, placeholder_row, progress, row,
     section, value_label,
@@ -23,6 +24,8 @@ pub struct TodayPage {
     plan_box: gtk::Box,
     plan_list: gtk::ListBox,
     continue_list: gtk::ListBox,
+    projects_box: gtk::Box,
+    projects_list: gtk::ListBox,
     review_box: gtk::Box,
     review_list: gtk::ListBox,
     today_list: gtk::ListBox,
@@ -62,10 +65,12 @@ impl TodayPage {
 
         let (plan_box, plan_list) = section("Today’s Plan");
         let (continue_box, continue_list) = section("Continue");
+        let (projects_box, projects_list) = section("Projects");
         let (review_box, review_list) = section("Review");
         let (today_box, today_list) = section("Studied today");
         content.append(&plan_box);
         content.append(&continue_box);
+        content.append(&projects_box);
         content.append(&review_box);
         content.append(&today_box);
 
@@ -84,6 +89,8 @@ impl TodayPage {
             plan_box,
             plan_list,
             continue_list,
+            projects_box,
+            projects_list,
             review_box,
             review_list,
             today_list,
@@ -106,18 +113,28 @@ impl TodayPage {
                     n => format!("{n} pages to go"),
                 }
             });
-        let habits_left: Vec<String> = snap
+        let left: Vec<String> = snap
             .habits
             .iter()
             .filter(|h| !h.done())
             .map(|h| isolate(&h.habit.name))
+            .chain(
+                snap.projects
+                    .iter()
+                    .filter(|p| p.project.has_goal() && !p.done())
+                    .map(|p| isolate(&p.project.name)),
+            )
             .collect();
-        let summary = if goals.minutes <= 0.0 && goals.pages <= 0.0 && snap.habits.is_empty() {
+        let no_goal = goals.minutes <= 0.0
+            && goals.pages <= 0.0
+            && snap.habits.is_empty()
+            && !snap.projects.iter().any(|p| p.project.has_goal());
+        let summary = if no_goal {
             Some("No daily goal set. Use the pencil button to set one.".to_owned())
         } else if goals.met(studied) {
             Some("Daily goal reached. Nice work!".to_owned())
-        } else if !habits_left.is_empty() {
-            Some(format!("Habits left today: {}", habits_left.join(", ")))
+        } else if !left.is_empty() {
+            Some(format!("Left today: {}", left.join(", ")))
         } else {
             None
         };
@@ -182,6 +199,18 @@ impl TodayPage {
             ));
             r.add_suffix(&pill_button("Read", act, move || Action::Read(id)));
             self.continue_list.append(&r);
+        }
+
+        self.projects_list.remove_all();
+        let active: Vec<_> = snap
+            .projects
+            .iter()
+            .filter(|p| p.project.has_goal() || p.today > 0)
+            .collect();
+        self.projects_box.set_visible(!active.is_empty());
+        for status in active {
+            self.projects_list
+                .append(&project_row(status, &project_summary(status)));
         }
 
         self.plan_list.remove_all();

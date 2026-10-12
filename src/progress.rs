@@ -2,6 +2,7 @@ use crate::config::{Config, days_back};
 use crate::db::{self, Item, Kind};
 use crate::download::Source;
 use crate::habits::{self, HabitStatus};
+use crate::projects::{self, Project, ProjectStatus};
 use crate::review;
 use anyhow::Result;
 use chrono::{Datelike, Duration, NaiveDate};
@@ -143,11 +144,19 @@ pub struct Day {
     pub habits_met: u32,
     /// Sum of each habit's share of its goal, each capped at 1.
     pub habits_share: f64,
+    /// Commits in every project, with a goal or not.
+    pub commits: i64,
+    /// Projects whose goal counted this day (those with a goal, found by then).
+    pub projects_due: u32,
+    /// Projects whose goal was reached.
+    pub projects_met: u32,
+    /// Sum of each project's share of its goal, each capped at 1.
+    pub projects_share: f64,
 }
 
 impl Day {
     pub fn is_empty(&self) -> bool {
-        self.minutes <= 0.0 && self.pages <= 0 && self.habits_share <= 0.0
+        self.minutes <= 0.0 && self.pages <= 0 && self.habits_share <= 0.0 && self.commits <= 0
     }
 }
 
@@ -158,6 +167,10 @@ impl std::ops::AddAssign for Day {
         self.habits_due += other.habits_due;
         self.habits_met += other.habits_met;
         self.habits_share += other.habits_share;
+        self.commits += other.commits;
+        self.projects_due += other.projects_due;
+        self.projects_met += other.projects_met;
+        self.projects_share += other.projects_share;
     }
 }
 
@@ -171,7 +184,8 @@ impl std::iter::Sum for Day {
     }
 }
 
-/// Daily goals; 0 turns a goal off. Each habit due that day is a goal too.
+/// Daily goals; 0 turns a goal off. Each habit, and each project with a goal, due that day is a
+/// goal too.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Goals {
     pub minutes: f64,
@@ -179,19 +193,19 @@ pub struct Goals {
 }
 
 impl Goals {
-    /// 0 to 1: the average share of each goal that's on, habits included, each share capped
-    /// at 1. With no goal on, any study counts as 1.
+    /// 0 to 1: the average share of each goal that's on, habits and projects included, each
+    /// share capped at 1. With no goal on, any study counts as 1.
     pub fn progress(&self, day: Day) -> f64 {
         let shares: Vec<f64> = [(day.minutes, self.minutes), (day.pages as f64, self.pages)]
             .into_iter()
             .filter(|&(_, goal)| goal > 0.0)
             .map(|(done, goal)| (done / goal).clamp(0.0, 1.0))
             .collect();
-        let goals = shares.len() + day.habits_due as usize;
+        let goals = shares.len() + day.habits_due as usize + day.projects_due as usize;
         if goals == 0 {
             return if day.is_empty() { 0.0 } else { 1.0 };
         }
-        (shares.iter().sum::<f64>() + day.habits_share) / goals as f64
+        (shares.iter().sum::<f64>() + day.habits_share + day.projects_share) / goals as f64
     }
 
     pub fn met(&self, day: Day) -> bool {
@@ -216,6 +230,8 @@ pub struct Snapshot {
     pub reviewed_today: i64,
     /// Oldest first.
     pub habits: Vec<HabitStatus>,
+    /// Most recently committed to first.
+    pub projects: Vec<ProjectStatus>,
 }
 
 impl Snapshot {
@@ -297,18 +313,12 @@ impl Snapshot {
     /// Habits whose name contains `query`, or just the one named exactly that, so "Run" can
     /// still be picked next to "Running".
     pub fn find_habits(&self, query: &str) -> Vec<&HabitStatus> {
-        let found: Vec<&HabitStatus> = self
-            .habits
-            .iter()
-            .filter(|h| matches(&h.habit.name, query))
-            .collect();
-        match found
-            .iter()
-            .find(|h| h.habit.name.to_lowercase() == query.trim().to_lowercase())
-        {
-            Some(&exact) => vec![exact],
-            None => found,
-        }
+        find_named(&self.habits, |h| &h.habit.name, query)
+    }
+
+    /// Projects whose name contains `query`, or just the one named exactly that.
+    pub fn find_projects(&self, query: &str) -> Vec<&ProjectStatus> {
+        find_named(&self.projects, |p| &p.project.name, query)
     }
 
     /// Totals per week for the last `weeks` weeks (Monday first), oldest first.
@@ -344,6 +354,18 @@ impl Snapshot {
 
 fn matches(text: &str, query: &str) -> bool {
     text.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// Things whose name contains `query`, or just the one named exactly that.
+fn find_named<'a, T>(all: &'a [T], name: impl Fn(&T) -> &str, query: &str) -> Vec<&'a T> {
+    let found: Vec<&T> = all.iter().filter(|t| matches(name(t), query)).collect();
+    match found
+        .iter()
+        .find(|t| name(t).to_lowercase() == query.trim().to_lowercase())
+    {
+        Some(&exact) => vec![exact],
+        None => found,
+    }
 }
 
 pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
@@ -408,12 +430,22 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
 
     let habit_list = habits::list(conn)?;
     let habit_logs = habits::daily(conn)?;
-    if !habit_list.is_empty() {
+    let project_list = projects::list(conn)?;
+    let commit_logs = projects::daily(conn, cfg)?;
+    for &(date, _, commits) in &commit_logs {
+        days.entry(date).or_default().commits += commits;
+    }
+    let goal_projects: Vec<&Project> = project_list.iter().filter(|p| p.has_goal()).collect();
+    if !habit_list.is_empty() || !goal_projects.is_empty() {
         let amounts: HashMap<(NaiveDate, i64), i64> = habit_logs
             .iter()
             .map(|&(date, id, amount)| ((date, id), amount))
             .collect();
-        // Today too, so a day with no habit logged yet isn't counted as met.
+        let commits: HashMap<(NaiveDate, i64), i64> = commit_logs
+            .iter()
+            .map(|&(date, id, commits)| ((date, id), commits))
+            .collect();
+        // Today too, so a day with nothing logged yet isn't counted as met.
         let mut dates: BTreeSet<NaiveDate> = days.keys().copied().collect();
         dates.extend(habit_logs.iter().map(|l| l.0));
         dates.insert(today);
@@ -425,9 +457,16 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
                 day.habits_met += u32::from(habit.met(amount));
                 day.habits_share += habit.share(amount);
             }
+            for project in goal_projects.iter().filter(|p| p.added <= date) {
+                let n = commits.get(&(date, project.id)).copied().unwrap_or(0);
+                day.projects_due += 1;
+                day.projects_met += u32::from(project.met(n));
+                day.projects_share += project.share(n);
+            }
         }
     }
     let habits = habits::statuses(&habit_list, &habit_logs, today);
+    let projects = projects::statuses(&project_list, &commit_logs, today);
 
     let mut grouped: BTreeMap<&str, Vec<&Item>> = BTreeMap::new();
     for item in items.iter().filter(|i| i.kind == Kind::Video) {
@@ -479,6 +518,7 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
         cards_total,
         reviewed_today,
         habits,
+        projects,
     })
 }
 
@@ -580,6 +620,24 @@ pub fn streaks_by(
     (current, best.max(current))
 }
 
+/// "5-day streak", "5-day streak, best 12" or "best: 12 days"; `None` before the first day the
+/// goal was met.
+pub fn streak_text(streak: usize, best: usize) -> Option<String> {
+    let days = |n: usize| {
+        if n == 1 {
+            "1 day".into()
+        } else {
+            format!("{n} days")
+        }
+    };
+    match (streak, best) {
+        (0, 0) => None,
+        (0, best) => Some(format!("best: {}", days(best))),
+        (s, best) if best > s => Some(format!("{s}-day streak, best {best}")),
+        (s, _) => Some(format!("{s}-day streak")),
+    }
+}
+
 /// "1h 05m", "12m" or "40s".
 pub fn fmt_duration(secs: f64) -> String {
     let secs = secs.max(0.0).round() as i64;
@@ -638,6 +696,7 @@ pub fn item_status(item: &Item) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Local, TimeZone};
 
     fn d(s: &str) -> NaiveDate {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
@@ -774,6 +833,61 @@ mod tests {
         assert!(snap.habits[0].done() && !snap.habits[1].done());
 
         habits::set_amount(&conn, run, today, 30).unwrap();
+        let snap = build(&conn, &cfg).unwrap();
+        assert!(snap.goals.met(snap.studied_today()));
+        assert_eq!(snap.streak, 3);
+    }
+
+    #[test]
+    fn projects_gate_the_streak_from_the_day_they_were_found() {
+        let conn = db::open_in_memory().unwrap();
+        let cfg = Config {
+            daily_goal_minutes: 0,
+            daily_goal_pages: 0,
+            ..Config::default()
+        };
+        let today = cfg.today();
+        let day = |n: i64| today - Duration::days(n);
+        let app = projects::add(&conn, Path::new("/p/app"), "app", day(2)).unwrap();
+        let notes = projects::add(&conn, Path::new("/p/notes"), "notes", day(2)).unwrap();
+        projects::set_goal(&conn, app, 2).unwrap();
+        // No goal: tracked, never due.
+        projects::set_goal(&conn, notes, 0).unwrap();
+        let commit = |date: NaiveDate, id: i64, n: i64| {
+            let noon = Local
+                .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+                .unwrap()
+                .timestamp();
+            for i in 0..n {
+                projects::record(&conn, id, noon + i).unwrap();
+            }
+        };
+        for (date, id, commits) in [
+            (day(4), app, 1),
+            (day(2), app, 2),
+            (day(1), app, 3),
+            (day(1), notes, 1),
+            (today, app, 1),
+        ] {
+            commit(date, id, commits);
+        }
+
+        let snap = build(&conn, &cfg).unwrap();
+        // Day 4 came before the project was found: its commit shows but isn't due.
+        assert_eq!(snap.studied_on(day(4)).commits, 1);
+        assert_eq!(snap.studied_on(day(4)).projects_due, 0);
+        assert_eq!(snap.studied_on(day(1)).commits, 4);
+        assert_eq!(snap.studied_on(day(1)).projects_due, 1);
+        assert_eq!(snap.studied_today().projects_share, 0.5);
+        assert!(!snap.goals.met(snap.studied_today()));
+        assert_eq!((snap.streak, snap.best_streak), (2, 2));
+        assert_eq!(snap.find_projects("APP").len(), 1);
+        let status = &snap.projects[0];
+        assert_eq!(status.project.name, "app");
+        assert_eq!((status.today, status.total, status.streak), (1, 7, 2));
+
+        // Today's noon commit is already there, so this adds one more.
+        commit(today, app, 2);
         let snap = build(&conn, &cfg).unwrap();
         assert!(snap.goals.met(snap.studied_today()));
         assert_eq!(snap.streak, 3);

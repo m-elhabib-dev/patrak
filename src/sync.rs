@@ -2,6 +2,7 @@ use crate::config::{self, Config, Paths};
 use crate::db::{self, Item, Kind};
 use crate::library;
 use crate::progress::fmt_duration;
+use crate::projects;
 use crate::review;
 use crate::sources::{mpv_events, watch_later, zathura};
 use anyhow::Result;
@@ -49,6 +50,9 @@ pub fn sync(conn: &mut Connection, cfg: &Config, paths: &Paths) -> Result<Report
     for (id, probe) in library::probe_all(to_probe) {
         db::set_probe(&tx, id, probe.duration, &probe.chapters, probe.total_pages)?;
     }
+
+    // Projects: commits in each git repository.
+    report.changes.extend(projects::sync(&tx, cfg)?);
 
     let mut items: HashMap<i64, Item> = db::items(&tx)?.into_iter().map(|i| (i.id, i)).collect();
     let was_done: HashSet<i64> = items

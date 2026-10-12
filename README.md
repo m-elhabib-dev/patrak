@@ -1,8 +1,8 @@
 # patrak
 
-A daily learning tracker. It watches folders of video courses and books, picks up your progress from
-**mpv** and **zathura** automatically, and shows how much you learned today, your streak, and what to
-watch or read next. It has a GTK4/libadwaita window and a CLI.
+A daily learning tracker. It watches folders of video courses, books and git projects, picks up your
+progress from **mpv**, **zathura** and your commits automatically, and shows how much you learned today,
+your streak, and what to watch or read next. It has a GTK4/libadwaita window and a CLI.
 
 ## Install
 
@@ -14,7 +14,7 @@ patrak setup
 
 `patrak setup` does the following:
 - writes `~/.config/patrak/config.toml`;
-- creates the library folders;
+- creates the library folders (Videos, Books and Projects);
 - installs the mpv script (`~/.config/mpv/scripts/patrak.lua`) and a launcher entry;
 - enables a daily reminder timer (`systemctl --user list-timers | grep patrak`).
 
@@ -29,6 +29,7 @@ To build without the GUI, use `cargo build --no-default-features`.
 ~/patrak/Videos/rust-from-scratch/02 - Ownership.mp4
 ~/patrak/Videos/One Long Lecture.mkv                ← a loose video is a one-lecture course
 ~/patrak/Books/Rust/The Rust Book.pdf               ← every pdf/epub/djvu is a book
+~/patrak/Projects/patrak/.git                       ← each git repository is a project
 ```
 
 - Lectures are ordered naturally, so `Episode 2` comes before `Episode 10`.
@@ -36,7 +37,8 @@ To build without the GUI, use `cargo build --no-default-features`.
 - A long lecture with chapters shows which chapter you're on.
 - Notes go to `<course>/notes/<lecture>.md`.
 
-You can add other folders, such as `~/Videos/Youtube`, in Preferences → Library or in `config.toml`.
+You can add other folders, such as `~/Videos/Youtube` or `~/Programming`, in Preferences → Library or in
+`config.toml` (`video_dirs`, `book_dirs`, `project_dirs`).
 
 ## Where progress comes from
 
@@ -45,6 +47,7 @@ You can add other folders, such as `~/Videos/Youtube`, in Preferences → Librar
 | mpv script (`assets/patrak.lua`) | Real watch time (paused time doesn't count), position, and "finished" when a lecture plays to its end |
 | mpv `watch_later` files | Saved positions, including history from before you installed patrak |
 | zathura `bookmarks.sqlite` | The current page of each book; pages read count toward the pages goal |
+| git, in each project | Your commits, counted toward each project's goal |
 
 The library is synced every time the GUI refreshes and every time a CLI command runs. While mpv is playing,
 the window updates about once a minute. Study done before `day_starts_at` (04:00 by default) counts for the
@@ -57,7 +60,7 @@ There are two daily goals: minutes of video (`daily_goal_minutes`, 60 by default
 
 - Change them with the pencil button on the Today page, or in Preferences.
 - Card review time counts toward the minutes goal.
-- Each [habit](#habits) is a goal too.
+- Each [habit](#habits), and each [project](#projects) with a goal, is a goal too.
 - A day counts toward your streak, and shows green in the heatmap, only when every goal is met.
 - Set a goal to 0 to turn it off, for example to track only videos.
 
@@ -79,6 +82,31 @@ From the terminal:
 patrak habits            # today's habits
 patrak habit eat         # +1 for a count; a minutes habit is marked as done
 patrak habit run 45      # set today's amount; +15 or -1 change it instead
+```
+
+## Projects
+
+Each git repository in `~/patrak/Projects` is a project. A link to a repository works too, and so
+does a project folder that is a repository itself. The **Projects** page lists them with today's
+commits.
+
+- A project's progress is the number of commits you make in it each day. Each project has its own
+  daily goal: 1 commit to start with, which you can change with the pencil button or with
+  `patrak project <name> <n>`.
+- A goal of 0 keeps the project tracked without making it part of the daily goal.
+- Project goals are part of the daily goal, like habits. A day keeps your streak only when every
+  project with a goal reaches it.
+- A project counts from the day patrak finds it, so adding one doesn't break past streaks. Its
+  older commits still show in the heatmap and stats.
+- Only your own commits count. That means commits whose author email is the repository's
+  `user.email`, on any branch, tag or remote branch. Merge commits don't count.
+- A commit is counted on the day it was written. It still counts after you squash it, reset past
+  it or delete its branch. Rebased, amended and cherry-picked copies keep the original author time,
+  so they aren't counted twice.
+
+```sh
+patrak projects          # every project: today's commits, streak, last commit
+patrak project patrak 3  # set a project's daily goal; 0 turns it off
 ```
 
 ## Deadlines
@@ -160,10 +188,12 @@ patrak update [course]   download new episodes (--check to only list them)
 patrak review            review the cards due today
 patrak habits            today's habits against their goals
 patrak habit <h> [n]     log a habit: n sets today's amount, +n or -n changes it
+patrak projects          git projects: today's commits against each goal
+patrak project <p> [n]   show a project, or set its daily goal in commits
 patrak stats             heatmap, streaks, weekly totals
 patrak sync -v           rescan and show what changed
 ```
 
-Queries are case-insensitive substrings of course, lecture, book or habit names.
+Queries are case-insensitive substrings of course, lecture, book, habit or project names.
 
 For testing on a scratch library, set `PATRAK_CONFIG` and `PATRAK_DATA_DIR` to use a separate config file and database.

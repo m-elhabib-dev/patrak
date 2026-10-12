@@ -65,8 +65,15 @@ pub fn show(app: &Rc<App>) {
         "PDF, EPUB and DjVu files anywhere inside are books.",
         &old.book_dirs,
     );
+    let (project_group, project_dirs) = folder_group(
+        app,
+        "Project Folders",
+        "Every git repository inside is a project, and so is a folder that is one itself. Your commits count toward each project’s daily goal.",
+        &old.project_dirs,
+    );
     library.add(&video_group);
     library.add(&book_group);
+    library.add(&project_group);
 
     dialog.add(&general);
     dialog.add(&library);
@@ -89,6 +96,7 @@ pub fn show(app: &Rc<App>) {
         let cfg = Config {
             video_dirs: video_dirs.borrow().clone(),
             book_dirs: book_dirs.borrow().clone(),
+            project_dirs: project_dirs.borrow().clone(),
             daily_goal_minutes: goal.value().round() as u32,
             daily_goal_pages: pages.value().round() as u32,
             complete_threshold: threshold.value() / 100.0,

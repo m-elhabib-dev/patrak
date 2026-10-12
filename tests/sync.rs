@@ -7,6 +7,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 struct Fixture {
@@ -45,6 +46,7 @@ impl Fixture {
         let cfg = Config {
             video_dirs: vec![root.join("Videos").to_string_lossy().into()],
             book_dirs: vec![root.join("Books").to_string_lossy().into()],
+            project_dirs: vec![root.join("Projects").to_string_lossy().into()],
             mpv_watch_later_dir: root.join("watch_later").to_string_lossy().into(),
             zathura_db: root.join("zathura.sqlite").to_string_lossy().into(),
             day_starts_at: "00:00".into(),
@@ -196,4 +198,85 @@ fn deleted_files_drop_out_of_the_library() {
     fs::remove_file(fx.video("03 Traits.mp4")).unwrap();
     fx.sync();
     assert_eq!(fx.snapshot().courses[0].lectures.len(), 2);
+}
+
+/// Runs git in `dir` without the user's own config, so signing and hooks can't get in the way.
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+#[test]
+fn projects_count_the_users_own_commits() {
+    let mut fx = Fixture::new(true);
+    let repo = fx.root.join("Projects/app");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "Me"]);
+    git(&repo, &["config", "user.email", "me@example.com"]);
+    // Commits are told apart by author time, so give each its own second.
+    let now = chrono::Utc::now().timestamp();
+    let next = std::cell::Cell::new(now - 20);
+    let commit = |message: &str, extra: &[&str]| {
+        let date = format!("--date={} +0000", next.replace(next.get() + 1));
+        let mut args = vec!["commit", "-q", "--allow-empty", "-m", message, &date];
+        args.extend(extra);
+        git(&repo, &args);
+    };
+    commit("one", &[]);
+    commit("theirs", &["--author", "Someone <someone@example.com>"]);
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    commit("two", &[]);
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["merge", "-q", "--no-ff", "-m", "merge", "feature"]);
+
+    let report = fx.sync();
+    assert!(report.changes.contains(&"project  app".to_owned()));
+    let snap = fx.snapshot();
+    let today = snap.studied_today();
+    // Not the other author's commit, and not the merge.
+    assert_eq!(today.commits, 2);
+    assert_eq!((today.projects_due, today.projects_met), (1, 1));
+    let app = &snap.projects[0];
+    assert_eq!((app.project.name.as_str(), app.today), ("app", 2));
+    assert_eq!(app.project.added, snap.today);
+
+    // Throwing commits away doesn't take them back.
+    git(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    git(&repo, &["branch", "-q", "-D", "feature"]);
+    fx.sync();
+    assert_eq!(fx.snapshot().studied_today().commits, 2);
+
+    commit("three", &[]);
+    fx.sync();
+    assert_eq!(fx.snapshot().projects[0].today, 3);
+    // An amended commit keeps its author time, so it isn't counted twice.
+    git(
+        &repo,
+        &[
+            "commit",
+            "-q",
+            "--amend",
+            "--allow-empty",
+            "-m",
+            "three, amended",
+        ],
+    );
+    fx.sync();
+    assert_eq!(fx.snapshot().projects[0].today, 3);
+
+    // A project that disappears keeps its history but drops off the list.
+    fs::remove_dir_all(&repo).unwrap();
+    fx.sync();
+    let snap = fx.snapshot();
+    assert!(snap.projects.is_empty());
+    assert_eq!(snap.studied_today().commits, 3);
+    assert_eq!(snap.studied_today().projects_due, 0);
 }

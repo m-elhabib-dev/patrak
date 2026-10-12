@@ -19,8 +19,8 @@ struct Args {
 enum Cmd {
     /// Open the window (the default when no command is given)
     Gui {
-        /// Page to open: today, courses, books, habits or stats
-        #[arg(long, value_parser = ["today", "courses", "books", "habits", "stats"])]
+        /// Page to open: today, courses, books, projects, habits or stats
+        #[arg(long, value_parser = ["today", "courses", "books", "projects", "habits", "stats"])]
         page: Option<String>,
     },
     /// Today's minutes and pages against the daily goals, and what's next
@@ -58,6 +58,10 @@ enum Cmd {
     },
     /// Review the cards due today (Q:/A: lines in your notes)
     Review,
+    /// Git projects: today's commits against each project's goal
+    Projects,
+    /// Show a project, or set its daily goal in commits (0 turns it off)
+    Project { name: String, goal: Option<u32> },
     /// Today's habits against their goals
     Habits,
     /// Log a habit: 3 sets today's amount, +2 or -1 changes it; no amount adds 1 time,
@@ -100,6 +104,8 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Add { url, name }) => cli::add(url, name),
         Some(Cmd::Update { query, check }) => cli::update(query, check),
         Some(Cmd::Review) => cli::review(),
+        Some(Cmd::Projects) => cli::projects(),
+        Some(Cmd::Project { name, goal }) => cli::project(name, goal),
         Some(Cmd::Habits) => cli::habits(),
         Some(Cmd::Habit { name, amount }) => cli::habit(name, amount),
         Some(Cmd::Stats) => cli::stats(),

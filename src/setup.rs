@@ -45,6 +45,7 @@ pub fn create_library_dirs(cfg: &Config) -> Result<Vec<PathBuf>> {
         .video_roots()
         .into_iter()
         .chain(cfg.book_roots())
+        .chain(cfg.project_roots())
         .collect();
     for d in &dirs {
         std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;

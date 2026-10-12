@@ -2,6 +2,7 @@ use super::widgets::{label, page, progress, value_label};
 use adw::prelude::*;
 use chrono::{Datelike, Duration};
 use patrak::progress::{Day, Snapshot, fmt_duration};
+use patrak::projects;
 
 const WEEKS: i64 = 26;
 
@@ -123,17 +124,27 @@ impl StatsPage {
                 if date <= snap.today {
                     cell.add_css_class(&format!("heat-{}", snap.heat_level(date)));
                     let studied = snap.studied_on(date);
-                    let habits = if studied.habits_due > 0 {
-                        format!("  ·  {}/{} habits", studied.habits_met, studied.habits_due)
-                    } else {
-                        String::new()
-                    };
-                    cell.set_tooltip_text(Some(&format!(
-                        "{}  ·  {:.0} min  ·  {} pages{habits}",
-                        date.format("%a %-d %b"),
-                        studied.minutes,
-                        studied.pages
-                    )));
+                    let mut parts = vec![
+                        date.format("%a %-d %b").to_string(),
+                        format!("{:.0} min", studied.minutes),
+                        format!("{} pages", studied.pages),
+                    ];
+                    if studied.commits > 0 {
+                        parts.push(projects::count(studied.commits));
+                    }
+                    if studied.habits_due > 0 {
+                        parts.push(format!(
+                            "{}/{} habits",
+                            studied.habits_met, studied.habits_due
+                        ));
+                    }
+                    if studied.projects_due > 0 {
+                        parts.push(format!(
+                            "{}/{} projects",
+                            studied.projects_met, studied.projects_due
+                        ));
+                    }
+                    cell.set_tooltip_text(Some(&parts.join("  ·  ")));
                 }
                 self.heat
                     .attach(&cell, week as i32 + 1, day as i32 + 1, 1, 1);
@@ -171,6 +182,13 @@ impl StatsPage {
                 pages.set_xalign(1.0);
                 pages.set_width_chars(10);
                 self.weeks.attach(&pages, 3, row, 1, 1);
+            }
+            if week.commits > 0 {
+                let commits =
+                    value_label(&projects::count(week.commits), &["numeric", "dim-label"]);
+                commits.set_xalign(1.0);
+                commits.set_width_chars(11);
+                self.weeks.attach(&commits, 4, row, 1, 1);
             }
         }
     }

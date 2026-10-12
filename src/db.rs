@@ -154,6 +154,26 @@ CREATE TABLE habit_daily (
 );
 ";
 
+/// Version 4: git projects. `added` is the first study day a project's goal counts on; `refs`
+/// fingerprints the branch and tag tips its commits were last counted at. `project_commits` has
+/// one row per commit of the user's, by author time.
+const SCHEMA_V4: &str = "
+CREATE TABLE projects (
+    id      INTEGER PRIMARY KEY,
+    path    TEXT    NOT NULL UNIQUE,
+    name    TEXT    NOT NULL,
+    goal    INTEGER NOT NULL,
+    added   TEXT    NOT NULL,
+    refs    TEXT,
+    missing INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE project_commits (
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    ts         INTEGER NOT NULL,
+    PRIMARY KEY (project_id, ts)
+);
+";
+
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -186,6 +206,11 @@ fn init(conn: &Connection) -> Result<()> {
     if version < 3 {
         conn.execute_batch(&format!(
             "BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;"
+        ))?;
+    }
+    if version < 4 {
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V4} PRAGMA user_version = 4; COMMIT;"
         ))?;
     }
     Ok(())

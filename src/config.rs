@@ -13,6 +13,8 @@ pub struct Config {
     pub video_dirs: Vec<String>,
     /// Every pdf/epub/djvu below these directories is a book.
     pub book_dirs: Vec<String>,
+    /// Each git repository inside is a project; a directory that is itself a repository is one too.
+    pub project_dirs: Vec<String>,
     /// Minutes of lectures watched (and cards reviewed) a day; 0 turns this goal off.
     pub daily_goal_minutes: u32,
     /// Book pages read a day; 0 turns this goal off.
@@ -36,6 +38,7 @@ impl Default for Config {
         Self {
             video_dirs: vec!["~/patrak/Videos".into()],
             book_dirs: vec!["~/patrak/Books".into()],
+            project_dirs: vec!["~/patrak/Projects".into()],
             daily_goal_minutes: 60,
             daily_goal_pages: 20,
             complete_threshold: 0.95,
@@ -75,6 +78,10 @@ impl Config {
 
     pub fn book_roots(&self) -> Vec<PathBuf> {
         self.book_dirs.iter().map(|d| expand(d)).collect()
+    }
+
+    pub fn project_roots(&self) -> Vec<PathBuf> {
+        self.project_dirs.iter().map(|d| expand(d)).collect()
     }
 
     pub fn day_start(&self) -> NaiveTime {

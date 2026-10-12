@@ -109,19 +109,7 @@ impl HabitStatus {
     /// "5-day streak", "5-day streak, best 12" or "best: 12 days"; `None` before the first
     /// day the goal was met.
     pub fn streak_text(&self) -> Option<String> {
-        let days = |n: usize| {
-            if n == 1 {
-                "1 day".into()
-            } else {
-                format!("{n} days")
-            }
-        };
-        match (self.streak, self.best_streak) {
-            (0, 0) => None,
-            (0, best) => Some(format!("best: {}", days(best))),
-            (s, best) if best > s => Some(format!("{s}-day streak, best {best}")),
-            (s, _) => Some(format!("{s}-day streak")),
-        }
+        progress::streak_text(self.streak, self.best_streak)
     }
 }
 

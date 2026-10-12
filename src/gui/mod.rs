@@ -5,6 +5,7 @@ mod habit_dialog;
 mod habits;
 mod notes;
 mod prefs;
+mod projects;
 mod review_dialog;
 mod stats;
 mod today;
@@ -62,6 +63,8 @@ pub enum Action {
     },
     NewHabit,
     EditHabit(i64),
+    /// Change a project's daily goal.
+    EditProject(i64),
     /// Look for new episodes of a downloaded course.
     CheckCourse(PathBuf),
     /// Download new episodes of a downloaded course.
@@ -83,7 +86,7 @@ const CSS: &str = "
 levelbar.goal block { min-height: 14px; border-radius: 7px; }
 ";
 
-/// Opens the window, showing `page` (today, courses, books, habits or stats) if given.
+/// Opens the window, showing `page` (today, courses, books, projects, habits or stats) if given.
 pub fn run(page: Option<String>) {
     let app = adw::Application::builder()
         .application_id(setup::APP_ID)
@@ -118,6 +121,7 @@ struct App {
     today: today::TodayPage,
     courses: courses::CoursesPage,
     books: books::BooksPage,
+    projects: projects::ProjectsPage,
     habits: habits::HabitsPage,
     stats: stats::StatsPage,
     paths: Paths,
@@ -147,6 +151,7 @@ impl App {
             let today = today::TodayPage::new(act.clone());
             let courses = courses::CoursesPage::new(act.clone());
             let books = books::BooksPage::new(act.clone());
+            let projects = projects::ProjectsPage::new(act.clone());
             let habits = habits::HabitsPage::new(act.clone());
             let stats = stats::StatsPage::new();
 
@@ -163,6 +168,12 @@ impl App {
                 Some("books"),
                 "Books",
                 "accessories-dictionary-symbolic",
+            );
+            stack.add_titled_with_icon(
+                &projects.root,
+                Some("projects"),
+                "Projects",
+                "applications-engineering-symbolic",
             );
             stack.add_titled_with_icon(
                 &habits.root,
@@ -254,6 +265,7 @@ impl App {
                 today,
                 courses,
                 books,
+                projects,
                 habits,
                 stats,
                 paths,
@@ -405,6 +417,11 @@ impl App {
                     habit_dialog::show(self, Some(h.habit.clone()));
                 }
             }
+            Action::EditProject(id) => {
+                if let Some(p) = snap.projects.iter().find(|p| p.project.id == id) {
+                    projects::edit_goal(self, &p.project);
+                }
+            }
             Action::CheckCourse(dir) => self.check_sources(vec![dir], true),
             Action::UpdateCourse(dir) => download_dialog::show_update(self, dir),
             Action::OpenUrl(url) => {
@@ -493,6 +510,7 @@ impl App {
         self.today.update(&snap);
         self.courses.update(&snap);
         self.books.update(&snap);
+        self.projects.update(&snap);
         self.habits.update(&snap);
         self.stats.update(&snap);
         *self.snapshot.borrow_mut() = Some(snap.clone());
