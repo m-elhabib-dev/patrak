@@ -75,14 +75,24 @@ pub fn value_label(text: &str, classes: &[&str]) -> gtk::Label {
 
 /// A dialog with a header bar above `child`.
 pub fn dialog(title: &str, child: &impl IsA<gtk::Widget>) -> adw::Dialog {
+    dialog_with_header(title, child).0
+}
+
+/// Like [`dialog`], also returning the header bar to add buttons to.
+pub fn dialog_with_header(
+    title: &str,
+    child: &impl IsA<gtk::Widget>,
+) -> (adw::Dialog, adw::HeaderBar) {
+    let header = adw::HeaderBar::new();
     let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.add_top_bar(&header);
     toolbar.set_content(Some(child));
-    adw::Dialog::builder()
+    let dialog = adw::Dialog::builder()
         .title(title)
         .content_width(560)
         .child(&toolbar)
-        .build()
+        .build();
+    (dialog, header)
 }
 
 pub fn row(title: &str, subtitle: &str) -> adw::ActionRow {

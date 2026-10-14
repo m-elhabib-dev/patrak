@@ -140,6 +140,9 @@ struct App {
     stats: stats::StatsPage,
     /// Whether today is a holiday; the header's toggle button follows its state.
     holiday: gio::SimpleAction,
+    downloads: Rc<download_dialog::Downloads>,
+    /// Closing the window was confirmed although downloads were running.
+    quitting: Cell<bool>,
     paths: Paths,
     cfg: RefCell<Config>,
     snapshot: RefCell<Option<Rc<Snapshot>>>,
@@ -242,8 +245,10 @@ impl App {
             header.set_title_widget(Some(&switcher));
             header.pack_start(&add);
             header.pack_start(&refresh);
+            let downloads = download_dialog::Downloads::new();
             header.pack_end(&menu_button);
             header.pack_end(&holiday_button);
+            header.pack_end(&downloads.button);
 
             let banner = adw::Banner::builder()
                 .title("Finish setup to track mpv watch time and get reminders")
@@ -289,6 +294,8 @@ impl App {
                 habits,
                 stats,
                 holiday,
+                downloads,
+                quitting: Cell::new(false),
                 paths,
                 cfg: RefCell::new(cfg),
                 snapshot: RefCell::new(None),
@@ -322,6 +329,19 @@ impl App {
             {
                 app.refresh();
             }
+        });
+
+        let weak = Rc::downgrade(&app);
+        app.window.connect_close_request(move |_| {
+            let Some(app) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let running = app.downloads.running();
+            if running == 0 || app.quitting.get() {
+                return glib::Propagation::Proceed;
+            }
+            app.confirm_quit(running);
+            glib::Propagation::Stop
         });
 
         let weak = Rc::downgrade(&app);
@@ -704,6 +724,32 @@ impl App {
             app.update_banner();
             app.refresh();
         });
+    }
+
+    /// Asks before closing the window stops `running` downloads.
+    fn confirm_quit(self: &Rc<Self>, running: usize) {
+        let what = match running {
+            1 => "A download is".to_owned(),
+            n => format!("{n} downloads are"),
+        };
+        let alert = adw::AlertDialog::new(
+            Some("Stop Downloads?"),
+            Some(&format!(
+                "{what} still running. What’s downloaded so far is kept, and Download New resumes it."
+            )),
+        );
+        alert.add_responses(&[("cancel", "Keep Downloading"), ("quit", "Stop and Quit")]);
+        alert.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
+        alert.set_default_response(Some("cancel"));
+        alert.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        alert.connect_response(Some("quit"), move |_, _| {
+            let Some(app) = weak.upgrade() else { return };
+            app.downloads.stop_all();
+            app.quitting.set(true);
+            app.window.close();
+        });
+        alert.present(Some(&self.window));
     }
 
     fn show_about(&self) {
