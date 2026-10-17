@@ -12,6 +12,9 @@ use std::rc::{Rc, Weak};
 /// yt-dlp stops cleanly on SIGINT, keeping partial files to resume from.
 const SIGINT: i32 = 2;
 
+/// How many lines of yt-dlp output a download's log keeps.
+const LOG_LINES: i32 = 1000;
+
 /// Asks for a playlist URL, then downloads it as a new course.
 pub fn show_add(app: &Rc<App>) {
     let cfg = app.cfg.borrow().clone();
@@ -117,6 +120,7 @@ pub fn show_update(app: &Rc<App>, dir: PathBuf) {
 /// Presents a dialog that never closes by itself. Minimizing or closing it while `job` is
 /// working moves the job into the header's downloads list, where it carries on.
 fn open(app: &Rc<App>, title: &str, child: &impl IsA<gtk::Widget>, job: &Rc<Job>) {
+    *job.title.borrow_mut() = title.to_owned();
     let (dialog, header) = dialog_with_header(title, child);
     let minimize = gtk::Button::builder()
         .icon_name("window-minimize-symbolic")
@@ -136,7 +140,7 @@ fn open(app: &Rc<App>, title: &str, child: &impl IsA<gtk::Widget>, job: &Rc<Job>
         if let Some(app) = weak.upgrade()
             && job.working.get()
         {
-            app.downloads.adopt(&job);
+            app.downloads.adopt(&app, &job);
         }
     });
     dialog.present(Some(&app.window));
@@ -257,16 +261,11 @@ impl Downloads {
     }
 
     /// Moves a job from its closing dialog to the top of the list.
-    fn adopt(self: &Rc<Self>, job: &Rc<Job>) {
-        job.page.remove(&job.root);
-        for set in [
-            gtk::Widget::set_margin_top,
-            gtk::Widget::set_margin_bottom,
-            gtk::Widget::set_margin_start,
-            gtk::Widget::set_margin_end,
-        ] {
-            set(job.root.upcast_ref(), 6);
+    fn adopt(self: &Rc<Self>, app: &Rc<App>, job: &Rc<Job>) {
+        if let Some(page) = job.root.parent().and_downcast::<gtk::Box>() {
+            page.remove(&job.root);
         }
+        job.set_margins(6, 6, 6, 6);
         job.heading.remove_css_class("title-4");
         job.heading.add_css_class("heading");
         if self.list.first_child().is_some() {
@@ -276,14 +275,56 @@ impl Downloads {
         self.list.prepend(&job.root);
         job.adopted.set(true);
         job.dismiss.set_visible(!job.working.get());
+        job.expand.set_visible(true);
 
-        let (weak, job_weak) = (Rc::downgrade(self), Rc::downgrade(job));
-        job.dismiss.connect_clicked(move |_| {
-            if let (Some(downloads), Some(job)) = (weak.upgrade(), job_weak.upgrade()) {
-                downloads.dismiss(&job);
-            }
-        });
+        if !job.wired.replace(true) {
+            let (weak, job_weak) = (Rc::downgrade(self), Rc::downgrade(job));
+            job.dismiss.connect_clicked(move |_| {
+                if let (Some(downloads), Some(job)) = (weak.upgrade(), job_weak.upgrade()) {
+                    downloads.dismiss(&job);
+                }
+            });
+            let (weak, job_weak, app_weak) =
+                (Rc::downgrade(self), Rc::downgrade(job), Rc::downgrade(app));
+            job.expand.connect_clicked(move |_| {
+                if let (Some(downloads), Some(job), Some(app)) =
+                    (weak.upgrade(), job_weak.upgrade(), app_weak.upgrade())
+                {
+                    downloads.reopen(&app, &job);
+                }
+            });
+        }
         self.update_button();
+    }
+
+    /// Takes a job back out of the list into a new dialog.
+    fn reopen(&self, app: &Rc<App>, job: &Rc<Job>) {
+        self.button.popdown();
+        self.detach(job);
+        job.set_margins(12, 24, 24, 24);
+        job.heading.remove_css_class("heading");
+        job.heading.add_css_class("title-4");
+        job.adopted.set(false);
+        job.dismiss.set_visible(false);
+        job.expand.set_visible(false);
+        // A finished download closed from its dialog is simply gone, like a dismissed one.
+        if !job.working.get() {
+            self.jobs.borrow_mut().retain(|j| !Rc::ptr_eq(j, job));
+        }
+        self.update_button();
+
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&job.root);
+        let title = job.title.borrow().clone();
+        open(app, &title, &page, job);
+    }
+
+    /// Removes a job and its neighbouring separator from the list.
+    fn detach(&self, job: &Rc<Job>) {
+        if let Some(separator) = job.root.next_sibling().or_else(|| job.root.prev_sibling()) {
+            self.list.remove(&separator);
+        }
+        self.list.remove(&job.root);
     }
 
     fn end(&self, job: &Rc<Job>) {
@@ -300,10 +341,7 @@ impl Downloads {
     }
 
     fn dismiss(&self, job: &Rc<Job>) {
-        if let Some(separator) = job.root.next_sibling().or_else(|| job.root.prev_sibling()) {
-            self.list.remove(&separator);
-        }
-        self.list.remove(&job.root);
+        self.detach(job);
         self.jobs.borrow_mut().retain(|j| !Rc::ptr_eq(j, job));
         self.update_button();
     }
@@ -355,10 +393,24 @@ struct Job {
     heading: gtk::Label,
     bar: gtk::ProgressBar,
     status: gtk::Label,
+    /// The video being fetched: its title, bar and size. Shown once progress arrives.
+    file: gtk::Box,
+    file_title: gtk::Label,
+    file_bar: gtk::ProgressBar,
+    file_size: gtk::Label,
     detail: gtk::Label,
     stop: gtk::Button,
     /// Removes a finished download from the list.
     dismiss: gtk::Button,
+    /// Brings a listed download back into a dialog.
+    expand: gtk::Button,
+    /// What yt-dlp printed besides progress, shown on request.
+    log: gtk::TextBuffer,
+    log_view: gtk::TextView,
+    /// The dialog's title, for reopening it.
+    title: RefCell<String>,
+    /// `dismiss` and `expand` are connected.
+    wired: Cell<bool>,
     /// The minimize button in the dialog's header bar. Only weakly held: a button outliving
     /// its `adw::HeaderBar` crashes when shown or hidden.
     minimize: glib::WeakRef<gtk::Button>,
@@ -392,8 +444,28 @@ impl Job {
             .build();
         dismiss.add_css_class("flat");
         dismiss.add_css_class("circular");
+        let expand = gtk::Button::builder()
+            .icon_name("view-fullscreen-symbolic")
+            .tooltip_text("Show in a window")
+            .valign(gtk::Align::Start)
+            .visible(false)
+            .build();
+        expand.add_css_class("flat");
+        expand.add_css_class("circular");
+        let log_toggle = gtk::ToggleButton::builder()
+            .icon_name("utilities-terminal-symbolic")
+            .tooltip_text("Show log")
+            .valign(gtk::Align::Start)
+            .build();
+        log_toggle.add_css_class("flat");
+        log_toggle.add_css_class("circular");
+        log_toggle.connect_toggled(|t| {
+            t.set_tooltip_text(Some(if t.is_active() { "Hide log" } else { "Show log" }));
+        });
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         top.append(&heading);
+        top.append(&log_toggle);
+        top.append(&expand);
         top.append(&dismiss);
 
         let bar = gtk::ProgressBar::builder()
@@ -410,15 +482,57 @@ impl Job {
         middle.append(&stop);
 
         let status = label("", &[]);
+        let file_title = label("", &["caption"]);
+        file_title.set_wrap(false);
+        file_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let file_bar = gtk::ProgressBar::new();
+        let file_size = label("", &["caption", "dim-label"]);
+        let file = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .visible(false)
+            .build();
+        for w in [
+            file_title.upcast_ref::<gtk::Widget>(),
+            file_bar.upcast_ref(),
+            file_size.upcast_ref(),
+        ] {
+            file.append(w);
+        }
         let detail = label("", &["caption", "dim-label"]);
         detail.set_selectable(true);
         detail.set_lines(6);
         detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let log = gtk::TextBuffer::new(None);
+        let log_view = gtk::TextView::builder()
+            .buffer(&log)
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .left_margin(8)
+            .right_margin(8)
+            .top_margin(6)
+            .bottom_margin(6)
+            .build();
+        let log_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_height(160)
+            .child(&log_view)
+            .visible(false)
+            .build();
+        log_scroller.add_css_class("card");
+        log_toggle
+            .bind_property("active", &log_scroller, "visible")
+            .sync_create()
+            .build();
         for w in [
             top.upcast_ref::<gtk::Widget>(),
             middle.upcast_ref(),
             status.upcast_ref(),
+            file.upcast_ref(),
             detail.upcast_ref(),
+            log_scroller.upcast_ref(),
         ] {
             root.append(w);
         }
@@ -438,9 +552,18 @@ impl Job {
                 heading,
                 bar,
                 status,
+                file,
+                file_title,
+                file_bar,
+                file_size,
                 detail,
                 stop,
                 dismiss,
+                expand,
+                log,
+                log_view,
+                title: RefCell::new(String::new()),
+                wired: Cell::new(false),
                 minimize: glib::WeakRef::new(),
                 working: Cell::new(false),
                 adopted: Cell::new(false),
@@ -482,28 +605,71 @@ impl Job {
     }
 
     fn progress(&self, p: &Progress) {
-        match p.overall() {
+        let overall = p.overall();
+        match overall {
             Some(f) => self.bar.set_fraction(f),
             None => self.bar.pulse(),
         }
-        let position = match (p.index, p.count) {
-            (Some(i), Some(n)) => format!("{i} of {n}  ·  "),
+        let mut total = String::from("Total");
+        if let (Some(i), Some(n)) = (p.index, p.count) {
+            total.push_str(&format!("  ·  {i} of {n}"));
+        }
+        if let Some(f) = overall {
+            total.push_str(&format!("  ·  {:.0}%", f * 100.0));
+        }
+        self.status.set_label(&total);
+
+        self.file.set_visible(true);
+        self.file_title.set_label(&isolate(&p.title));
+        match p.fraction {
+            Some(f) => self.file_bar.set_fraction(f),
+            None => self.file_bar.pulse(),
+        }
+        let size = |b: f64| glib::format_size(b as u64);
+        self.file_size.set_label(&match (p.downloaded, p.total) {
+            (Some(d), Some(t)) => format!("{} of {}", size(d), size(t)),
+            (Some(d), None) => size(d).to_string(),
             _ => String::new(),
-        };
-        self.status
-            .set_label(&format!("{position}{}", isolate(&p.title)));
+        });
     }
 
     fn message(&self, line: &str) {
         self.detail.set_label(line);
+        self.log_line(line);
         if self.bar.fraction() == 0.0 {
             self.bar.pulse();
         }
     }
 
+    /// Appends to the log, keeping the last `LOG_LINES` and following the newest.
+    fn log_line(&self, line: &str) {
+        self.log.insert(&mut self.log.end_iter(), &format!("{line}\n"));
+        let extra = self.log.line_count() - LOG_LINES;
+        if extra > 0
+            && let Some(mut cut) = self.log.iter_at_line(extra)
+        {
+            self.log.delete(&mut self.log.start_iter(), &mut cut);
+        }
+        let mark = match self.log.mark("end") {
+            Some(mark) => mark,
+            None => self.log.create_mark(Some("end"), &self.log.end_iter(), false),
+        };
+        self.log.move_mark(&mark, &self.log.end_iter());
+        self.log_view.scroll_mark_onscreen(&mark);
+    }
+
+    fn set_margins(&self, top: i32, bottom: i32, start: i32, end: i32) {
+        self.root.set_margin_top(top);
+        self.root.set_margin_bottom(bottom);
+        self.root.set_margin_start(start);
+        self.root.set_margin_end(end);
+    }
+
     fn done(&self, text: &str) {
         self.heading.set_label(text);
         self.bar.set_fraction(1.0);
+        self.file.set_visible(false);
+        self.status.set_visible(false);
         self.detail.set_label("New lectures appear in Courses.");
     }
 

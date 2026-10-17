@@ -296,6 +296,9 @@ fn yt_dlp(cfg: &Config, args: &[&str]) -> Result<String> {
 pub struct Progress {
     /// 0..1 for the current video.
     pub fraction: Option<f64>,
+    /// Bytes of the current video fetched so far, and its (estimated) size.
+    pub downloaded: Option<f64>,
+    pub total: Option<f64>,
     pub index: Option<usize>,
     pub count: Option<usize>,
     pub title: String,
@@ -327,6 +330,8 @@ pub fn parse_progress(line: &str) -> Option<Progress> {
     };
     Some(Progress {
         fraction,
+        downloaded: done,
+        total,
         index,
         count,
         title,
@@ -349,6 +354,7 @@ mod tests {
     fn parses_progress_lines() {
         let p = parse_progress("[patrak] 512|1024|3|12|Episode 3 | Raft").unwrap();
         assert_eq!(p.fraction, Some(0.5));
+        assert_eq!((p.downloaded, p.total), (Some(512.0), Some(1024.0)));
         assert_eq!((p.index, p.count), (Some(3), Some(12)));
         assert_eq!(p.title, "Episode 3 | Raft");
         assert!((p.overall().unwrap() - 2.5 / 12.0).abs() < 1e-9);
