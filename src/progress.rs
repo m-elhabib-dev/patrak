@@ -18,7 +18,7 @@ pub struct Course {
     pub key: String,
     pub name: String,
     pub dir: PathBuf,
-    /// Lectures in playback order, files that disappeared from disk excluded.
+    /// Lectures in playback order, including those whose file disappeared, which keep their progress.
     pub lectures: Vec<Item>,
     pub done: usize,
     pub total_secs: f64,
@@ -32,6 +32,8 @@ pub struct Course {
     pub pace: f64,
     pub today_secs: f64,
     pub deadline: Option<NaiveDate>,
+    /// Every lecture's file is gone.
+    pub missing: bool,
     /// Set for courses downloaded with `patrak add`.
     pub source: Option<Source>,
 }
@@ -299,7 +301,7 @@ impl Snapshot {
     pub fn last_book(&self) -> Option<&Item> {
         self.books
             .iter()
-            .find(|b| !b.is_done() && b.position_ts > 0)
+            .find(|b| !b.is_done() && !b.missing && b.position_ts > 0)
     }
 
     pub fn item(&self, id: i64) -> Option<&Item> {
@@ -400,10 +402,7 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
         minutes: f64::from(cfg.daily_goal_minutes),
         pages: f64::from(cfg.daily_goal_pages),
     };
-    let items: Vec<Item> = db::items(conn)?
-        .into_iter()
-        .filter(|i| !i.missing)
-        .collect();
+    let items: Vec<Item> = db::items(conn)?;
     let daily = db::daily(conn)?;
 
     let by_id: HashMap<i64, &Item> = items.iter().map(|i| (i.id, i)).collect();
@@ -485,7 +484,7 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
                 day.habits_met += u32::from(habit.met(amount));
                 day.habits_share += habit.share(amount);
             }
-            for project in goal_projects.iter().filter(|p| p.added <= date) {
+            for project in goal_projects.iter().filter(|p| p.counts_on(date)) {
                 let n = commits.get(&(date, project.id)).copied().unwrap_or(0);
                 day.projects_due += 1;
                 day.projects_met += u32::from(project.met(n));
@@ -554,13 +553,18 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
 fn course(key: &str, lectures: Vec<Item>, secs_per_day: f64, today: NaiveDate) -> Course {
     let done = lectures.iter().filter(|l| l.is_done()).count();
     let total_secs: f64 = lectures.iter().filter_map(|l| l.duration).sum();
+    let left = |l: &&Item| !l.is_done();
+    let secs_left = |l: &Item| l.duration.map(|d| (d - l.position).max(0.0));
+    let remaining_all: f64 = lectures.iter().filter(left).filter_map(secs_left).sum();
+    // What can still be watched: lectures whose file is gone can't be.
     let remaining_secs: f64 = lectures
         .iter()
-        .filter(|l| !l.is_done())
-        .filter_map(|l| l.duration.map(|d| (d - l.position).max(0.0)))
+        .filter(|l| !l.missing)
+        .filter(left)
+        .filter_map(secs_left)
         .sum();
     let fraction = if total_secs > 0.0 {
-        (total_secs - remaining_secs) / total_secs
+        (total_secs - remaining_all) / total_secs
     } else {
         done as f64 / lectures.len().max(1) as f64
     };
@@ -581,6 +585,7 @@ fn course(key: &str, lectures: Vec<Item>, secs_per_day: f64, today: NaiveDate) -
         pace: secs_per_day,
         today_secs: 0.0,
         deadline: None,
+        missing: lectures.iter().all(|l| l.missing),
         source: None,
         lectures,
     }
@@ -591,16 +596,18 @@ fn touched(item: &Item) -> i64 {
 }
 
 /// Resume the lecture touched last if it is unfinished; otherwise take the first unfinished
-/// lecture after it, falling back to the first unfinished one in the course.
+/// lecture after it, falling back to the first unfinished one in the course. Lectures whose
+/// file is gone are never picked.
 fn next_lecture(lectures: &[Item]) -> Option<usize> {
+    let open = |j: usize| !lectures[j].is_done() && !lectures[j].missing;
     let last = lectures
         .iter()
         .enumerate()
         .filter(|(_, l)| touched(l) > 0)
         .max_by_key(|(_, l)| touched(l))
         .map(|(i, _)| i);
-    last.and_then(|i| (i..lectures.len()).find(|&j| !lectures[j].is_done()))
-        .or_else(|| lectures.iter().position(|l| !l.is_done()))
+    last.and_then(|i| (i..lectures.len()).find(|&j| open(j)))
+        .or_else(|| (0..lectures.len()).find(|&j| open(j)))
 }
 
 /// (current, best) streaks of days that met the goals.
@@ -1002,8 +1009,8 @@ mod tests {
         };
         let today = cfg.today();
         let day = |n: i64| today - Duration::days(n);
-        let app = projects::add(&conn, Path::new("/p/app"), "app", day(2)).unwrap();
-        let notes = projects::add(&conn, Path::new("/p/notes"), "notes", day(2)).unwrap();
+        let app = projects::add(&conn, Path::new("/p/app"), "app", None, day(2)).unwrap();
+        let notes = projects::add(&conn, Path::new("/p/notes"), "notes", None, day(2)).unwrap();
         projects::set_goal(&conn, app, 2).unwrap();
         // No goal: tracked, never due.
         projects::set_goal(&conn, notes, 0).unwrap();

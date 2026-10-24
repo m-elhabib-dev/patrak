@@ -28,11 +28,20 @@ pub struct Project {
     pub goal: i64,
     /// The first study day the goal counts on.
     pub added: NaiveDate,
+    /// The repository is no longer on disk; its history stays.
+    pub missing: bool,
+    /// The study day it was found missing; its goal doesn't count from then on.
+    pub gone: Option<NaiveDate>,
 }
 
 impl Project {
     pub fn has_goal(&self) -> bool {
         self.goal > 0
+    }
+
+    /// Whether the goal counts on `date`: from the day the project was added until it went missing.
+    pub fn counts_on(&self, date: NaiveDate) -> bool {
+        self.has_goal() && self.added <= date && self.gone.is_none_or(|g| date < g)
     }
 
     /// Whether `commits` reach the goal; never true without one.
@@ -91,34 +100,43 @@ impl ProjectStatus {
     }
 }
 
-/// Every project still on disk, oldest first.
+/// Every project, including those no longer on disk, oldest first.
 pub fn list(conn: &Connection) -> Result<Vec<Project>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, name, path, goal, added FROM projects WHERE missing = 0 ORDER BY id",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT id, name, path, goal, added, missing, gone FROM projects ORDER BY id")?;
     let rows = stmt.query_map([], |r| {
         let path: String = r.get(2)?;
         let added: String = r.get(4)?;
+        let gone: Option<String> = r.get(6)?;
         Ok(Project {
             id: r.get(0)?,
             name: r.get(1)?,
             path: path.into(),
             goal: r.get(3)?,
             added: NaiveDate::parse_from_str(&added, "%Y-%m-%d").unwrap_or(NaiveDate::MIN),
+            missing: r.get(5)?,
+            gone: gone.and_then(|g| NaiveDate::parse_from_str(&g, "%Y-%m-%d").ok()),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Adds a project whose goal counts from `today` on; returns its id.
-pub fn add(conn: &Connection, path: &Path, name: &str, today: NaiveDate) -> Result<i64> {
+pub fn add(
+    conn: &Connection,
+    path: &Path,
+    name: &str,
+    root: Option<&str>,
+    today: NaiveDate,
+) -> Result<i64> {
     conn.execute(
-        "INSERT INTO projects (path, name, goal, added) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO projects (path, name, goal, added, root) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             path.to_string_lossy(),
             name,
             DEFAULT_GOAL,
-            today.to_string()
+            today.to_string(),
+            root
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -192,39 +210,72 @@ pub fn statuses(
         })
         .collect();
     out.sort_by(|a, b| {
-        b.last_commit
-            .cmp(&a.last_commit)
+        a.project
+            .missing
+            .cmp(&b.project.missing)
+            .then(b.last_commit.cmp(&a.last_commit))
             .then_with(|| natord::compare(&a.project.name, &b.project.name))
     });
     out
 }
 
 /// Finds the projects in the project folders and recounts the commits of each one whose
-/// branches or tags moved since the last count. Returns lines for `patrak sync -v`.
+/// branches or tags moved since the last count. A repository that turns up at a new path with
+/// the first commit of one that vanished is that project, moved. Returns lines for
+/// `patrak sync -v`.
 pub fn sync(conn: &Connection, cfg: &Config) -> Result<Vec<String>> {
     let today = cfg.today();
     let mut changes = Vec::new();
-    conn.execute("UPDATE projects SET missing = 1", [])?;
-    for found in find(cfg) {
+    conn.execute(
+        "UPDATE projects SET missing = 1, gone = COALESCE(gone, ?1)",
+        [today.to_string()],
+    )?;
+    let found = find(cfg);
+    let present: HashSet<String> = found
+        .iter()
+        .map(|f| f.path.to_string_lossy().into_owned())
+        .collect();
+    for found in found {
+        let path = found.path.to_string_lossy().into_owned();
+        let root = root_commit(&found.path);
         let existing: Option<(i64, Option<String>)> = conn
             .query_row(
                 "SELECT id, refs FROM projects WHERE path = ?1",
-                [found.path.to_string_lossy()],
+                [&path],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         let (id, counted_at) = match existing {
             Some((id, refs)) => {
                 conn.execute(
-                    "UPDATE projects SET name = ?2, missing = 0 WHERE id = ?1",
-                    params![id, found.name],
+                    "UPDATE projects SET name = ?2, missing = 0, gone = NULL, root = COALESCE(root, ?3)
+                     WHERE id = ?1",
+                    params![id, found.name, root],
                 )?;
                 (id, refs)
             }
-            None => {
-                changes.push(format!("project  {}", found.name));
-                (add(conn, &found.path, &found.name, today)?, None)
-            }
+            None => match root
+                .as_deref()
+                .and_then(|r| moved_from(conn, r, &present).transpose())
+            {
+                Some(old) => {
+                    let id = old?;
+                    conn.execute(
+                        "UPDATE projects SET path = ?2, name = ?3, missing = 0, gone = NULL, refs = NULL
+                         WHERE id = ?1",
+                        params![id, path, found.name],
+                    )?;
+                    changes.push(format!("moved    {}", found.name));
+                    (id, None)
+                }
+                None => {
+                    changes.push(format!("project  {}", found.name));
+                    (
+                        add(conn, &found.path, &found.name, root.as_deref(), today)?,
+                        None,
+                    )
+                }
+            },
         };
         let Some(refs) = refs_fingerprint(&found.path) else {
             continue;
@@ -248,6 +299,21 @@ pub fn sync(conn: &Connection, cfg: &Config) -> Result<Vec<String>> {
         }
     }
     Ok(changes)
+}
+
+/// The project with first commit `root` whose folder isn't among `present`, if there is one.
+fn moved_from(conn: &Connection, root: &str, present: &HashSet<String>) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT id, path FROM projects WHERE root = ?1 ORDER BY id")?;
+    let rows = stmt.query_map([root], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, path) = row?;
+        if !present.contains(&path) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 /// A git repository found in a project folder.
@@ -304,6 +370,15 @@ fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .output()
         .ok()?;
     out.status.success().then_some(out.stdout)
+}
+
+/// The hash of the repository's first commit, the same wherever the repository lives; the
+/// smallest when there are several.
+fn root_commit(dir: &Path) -> Option<String> {
+    let out = git(dir, &["rev-list", "--max-parents=0", "--all"])?;
+    let mut roots: Vec<&str> = std::str::from_utf8(&out).ok()?.lines().collect();
+    roots.sort_unstable();
+    roots.first().map(|r| (*r).to_owned())
 }
 
 /// Changes whenever a branch, remote branch or tag moves, i.e. whenever commits may have.
@@ -387,7 +462,7 @@ mod tests {
             Local.from_local_datetime(&naive).unwrap().timestamp()
         };
         let today = d("2026-10-11");
-        let id = add(&conn, Path::new("/p/app"), "app", today).unwrap();
+        let id = add(&conn, Path::new("/p/app"), "app", None, today).unwrap();
         assert!(record(&conn, id, at("2026-10-11 10:00")).unwrap());
         // The same commit again, say after a rebase.
         assert!(!record(&conn, id, at("2026-10-11 10:00")).unwrap());
@@ -418,6 +493,8 @@ mod tests {
             path: "/p/app".into(),
             goal: 2,
             added: d("2026-10-07"),
+            missing: false,
+            gone: None,
         };
         let day = |n: i64| today - Duration::days(n);
         let logs = [

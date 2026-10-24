@@ -55,14 +55,15 @@ impl BooksPage {
             }
             let (section_box, list) = section(title);
             for book in books {
-                let subtitle = if book.course.is_empty() {
-                    item_status(book)
+                let status = if book.missing {
+                    format!("File missing  ·  {}", item_status(book))
                 } else {
-                    format!(
-                        "{}  ·  {}",
-                        isolate(&book.course),
-                        isolate(&item_status(book))
-                    )
+                    item_status(book)
+                };
+                let subtitle = if book.course.is_empty() {
+                    status
+                } else {
+                    format!("{}  ·  {}", isolate(&book.course), isolate(&status))
                 };
                 let r = row(&book.title, &subtitle);
                 if let Some(f) = book.fraction() {
@@ -73,14 +74,18 @@ impl BooksPage {
                     r.add_suffix(&progress(f, 90));
                 }
                 let id = book.id;
-                r.add_suffix(&icon_button(
-                    "document-edit-symbolic",
-                    "Notes",
-                    &self.act,
-                    move || Action::Note(id),
-                ));
+                if !book.missing {
+                    r.add_suffix(&icon_button(
+                        "document-edit-symbolic",
+                        "Notes",
+                        &self.act,
+                        move || Action::Note(id),
+                    ));
+                }
                 r.add_suffix(&done_check(id, book.is_done(), &self.act));
-                r.add_suffix(&pill_button("Read", &self.act, move || Action::Read(id)));
+                if !book.missing {
+                    r.add_suffix(&pill_button("Read", &self.act, move || Action::Read(id)));
+                }
                 list.append(&r);
             }
             self.content.append(&section_box);

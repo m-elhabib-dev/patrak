@@ -158,7 +158,11 @@ impl TodayPage {
                 Some(quick_log_button(status, &self.act).upcast()),
             ));
         }
-        for status in snap.projects.iter().filter(|p| p.project.has_goal()) {
+        for status in snap
+            .projects
+            .iter()
+            .filter(|p| p.project.has_goal() && !p.project.missing)
+        {
             list.append(&project_row(status, &project_summary(status)));
         }
         if list.first_child().is_none() {
@@ -288,7 +292,6 @@ impl TodayPage {
         if studied.pages > 0 {
             totals.push(pages(studied.pages));
         }
-        // Not `studied.commits`, which counts projects no longer on disk too.
         let commits: i64 = snap.projects.iter().map(|p| p.today).sum();
         if commits > 0 {
             totals.push(projects::count(commits));

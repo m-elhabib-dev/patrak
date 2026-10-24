@@ -196,7 +196,12 @@ impl Inner {
             "Lectures"
         });
         for (i, lecture) in course.lectures.iter().enumerate() {
-            let r = row(&lecture.title, &item_status(lecture));
+            let status = if lecture.missing {
+                format!("File missing  ·  {}", item_status(lecture))
+            } else {
+                item_status(lecture)
+            };
+            let r = row(&lecture.title, &status);
             let number = label(&(i + 1).to_string(), &["dim-label", "numeric"]);
             number.set_width_chars(3);
             number.set_xalign(1.0);
@@ -205,23 +210,25 @@ impl Inner {
                 r.set_subtitle(&format!("Up next  ·  {}", item_status(lecture)));
                 r.add_css_class("accent");
             }
-            let key = course.key.clone();
-            r.add_suffix(&icon_button(
-                "media-playback-start-symbolic",
-                "Play from here",
-                act,
-                move || Action::Play {
-                    course_key: key.clone(),
-                    start: i,
-                },
-            ));
             let id = lecture.id;
-            r.add_suffix(&icon_button(
-                "document-edit-symbolic",
-                "Notes",
-                act,
-                move || Action::Note(id),
-            ));
+            if !lecture.missing {
+                let key = course.key.clone();
+                r.add_suffix(&icon_button(
+                    "media-playback-start-symbolic",
+                    "Play from here",
+                    act,
+                    move || Action::Play {
+                        course_key: key.clone(),
+                        start: i,
+                    },
+                ));
+                r.add_suffix(&icon_button(
+                    "document-edit-symbolic",
+                    "Notes",
+                    act,
+                    move || Action::Note(id),
+                ));
+            }
             r.add_suffix(&done_check(id, lecture.is_done(), act));
             list.append(&r);
         }
@@ -243,12 +250,14 @@ impl Inner {
                 }
                 r.add_prefix(&icon);
                 let (id, secs) = (lecture.id, ch.start);
-                r.add_suffix(&icon_button(
-                    "media-playback-start-symbolic",
-                    "Play this chapter",
-                    act,
-                    move || Action::PlayAt { item_id: id, secs },
-                ));
+                if !lecture.missing {
+                    r.add_suffix(&icon_button(
+                        "media-playback-start-symbolic",
+                        "Play this chapter",
+                        act,
+                        move || Action::PlayAt { item_id: id, secs },
+                    ));
+                }
                 list.append(&r);
             }
             self.content.append(&chapters_box);
@@ -264,6 +273,9 @@ fn summary(course: &Course) -> String {
     )];
     if course.total_secs > 0.0 {
         parts.push(format!("{:.0}%", course.fraction * 100.0));
+    }
+    if course.missing {
+        parts.push("files missing".into());
     }
     if course.remaining_secs > 0.0 {
         parts.push(format!("{} left", fmt_duration(course.remaining_secs)));

@@ -36,6 +36,9 @@ To build without the GUI, use `cargo build --no-default-features`.
 - Hidden files and yt-dlp `.part` leftovers are ignored.
 - A long lecture with chapters shows which chapter you're on.
 - Notes go to `<course>/notes/<lecture>.md`.
+- Moving or renaming a video, book or repository keeps its progress: files are matched by kind, size and
+  modified time, repositories by their first commit.
+- Deleted files and repositories stay listed as missing with their saved progress, history and streaks.
 
 You can add other folders, such as `~/Videos/Youtube` or `~/Programming`, in Preferences → Library or in
 `config.toml` (`video_dirs`, `book_dirs`, `project_dirs`).

@@ -131,7 +131,7 @@ fn print_today(snap: &Snapshot) {
     let active: Vec<&ProjectStatus> = snap
         .projects
         .iter()
-        .filter(|p| p.project.has_goal() || p.today > 0)
+        .filter(|p| (p.project.has_goal() && !p.project.missing) || p.today > 0)
         .collect();
     if !active.is_empty() {
         println!("\n{}", bold("Projects"));
@@ -233,8 +233,13 @@ fn print_project(p: &ProjectStatus) {
     } else {
         p.today
     });
+    let gone = if p.project.missing {
+        dim("  (missing)")
+    } else {
+        String::new()
+    };
     println!(
-        "  {}  {}{streak}",
+        "  {}  {}{streak}{gone}",
         goal_part(p.today as f64, p.project.goal as f64, unit),
         bold(&p.project.name)
     );
@@ -378,7 +383,11 @@ fn print_overview(snap: &Snapshot) {
             c.lectures.len(),
             left,
             dim(&eta),
-            bold(&c.name)
+            bold(&format!(
+                "{}{}",
+                c.name,
+                if c.missing { " (missing)" } else { "" }
+            ))
         );
         if let Some(summary) = c.plan_summary(snap.today) {
             println!("        {}", dim(&summary));
@@ -404,7 +413,11 @@ fn print_overview(snap: &Snapshot) {
             f * 100.0,
             bar(f, 12),
             dim(&item_status(b)),
-            bold(&b.title)
+            bold(&format!(
+                "{}{}",
+                b.title,
+                if b.missing { " (missing)" } else { "" }
+            ))
         );
     }
 }
@@ -429,7 +442,13 @@ fn print_course(c: &Course, today: NaiveDate) {
         println!("{}", dim(&format!("{}  ·  {new}", source.url)));
     }
     for (i, l) in c.lectures.iter().enumerate() {
-        let arrow = if Some(i) == c.next { "→" } else { " " };
+        let arrow = if Some(i) == c.next {
+            "→"
+        } else if l.missing {
+            "✗"
+        } else {
+            " "
+        };
         println!(
             "{arrow} {:>3}  {:<26} {}",
             i + 1,
@@ -471,6 +490,11 @@ pub fn next(query: Option<String>) -> Result<()> {
 pub fn play(query: Option<String>) -> Result<()> {
     let (mut session, snap) = session()?;
     let (course, start) = pick_course(&snap, query.as_deref())?;
+    anyhow::ensure!(
+        !course.lectures[start].missing,
+        "{} is missing from disk",
+        course.lectures[start].title
+    );
     println!("▶ {} — {}", course.name, course.lectures[start].title);
     run(launch::play_args(course, start))?;
     after_launch(&mut session)
@@ -482,9 +506,10 @@ pub fn read(query: Option<String>) -> Result<()> {
         Some(q) => one(snap.find_books(&q), "book", &q, |b| b.title.clone())?,
         None => snap
             .last_book()
-            .or(snap.books.first())
+            .or(snap.books.iter().find(|b| !b.missing))
             .context("no books found in book_dirs")?,
     };
+    anyhow::ensure!(!book.missing, "{} is missing from disk", book.title);
     println!("📖 {}", book.title);
     run(launch::read_args(book))?;
     after_launch(&mut session)
@@ -629,7 +654,7 @@ pub fn remind() -> Result<()> {
     for p in snap
         .projects
         .iter()
-        .filter(|p| p.project.has_goal() && !p.done())
+        .filter(|p| p.project.has_goal() && !p.project.missing && !p.done())
     {
         short.push(format!(
             "{} {}",

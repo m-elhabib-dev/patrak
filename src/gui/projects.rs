@@ -47,19 +47,21 @@ impl ProjectsPage {
         for status in &snap.projects {
             let r = project_row(status, &details(status, snap.today));
             let id = status.project.id;
-            r.add_suffix(&icon_button(
-                "document-edit-symbolic",
-                "Change daily goal",
-                &self.act,
-                move || Action::EditProject(id),
-            ));
-            let uri = gio::File::for_path(&status.project.path).uri().to_string();
-            r.add_suffix(&icon_button(
-                "folder-open-symbolic",
-                "Open folder",
-                &self.act,
-                move || Action::OpenUrl(uri.clone()),
-            ));
+            if !status.project.missing {
+                r.add_suffix(&icon_button(
+                    "document-edit-symbolic",
+                    "Change daily goal",
+                    &self.act,
+                    move || Action::EditProject(id),
+                ));
+                let uri = gio::File::for_path(&status.project.path).uri().to_string();
+                r.add_suffix(&icon_button(
+                    "folder-open-symbolic",
+                    "Open folder",
+                    &self.act,
+                    move || Action::OpenUrl(uri.clone()),
+                ));
+            }
             self.list.append(&r);
         }
     }
@@ -88,8 +90,17 @@ pub fn summary(status: &ProjectStatus) -> String {
 
 /// The summary, plus when the last commit was and whether there's a goal.
 fn details(status: &ProjectStatus, today: NaiveDate) -> String {
-    let mut parts = vec![summary(status)];
-    if !status.project.has_goal() {
+    let mut parts = vec![if status.project.missing {
+        "folder missing".to_owned()
+    } else {
+        summary(status)
+    }];
+    if status.project.missing {
+        parts.extend(status.streak_text());
+        if status.total > 0 {
+            parts.push(format!("{} in all", projects::count(status.total)));
+        }
+    } else if !status.project.has_goal() {
         parts.push("no daily goal".into());
     }
     if let Some(last) = status.last_commit.filter(|&d| d < today) {

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +181,18 @@ CREATE TABLE holidays (
 );
 ";
 
+/// Version 6: a project's first-commit hash, which survives moving the repository, and the study
+/// day it was found missing, so its goal stops counting from then on. Projects that were already
+/// gone count up to their last commit.
+const SCHEMA_V6: &str = "
+ALTER TABLE projects ADD COLUMN root TEXT;
+ALTER TABLE projects ADD COLUMN gone TEXT;
+UPDATE projects SET gone = COALESCE(
+    (SELECT date(MAX(ts), 'unixepoch', 'localtime', '+1 day') FROM project_commits
+     WHERE project_id = projects.id), added)
+WHERE missing = 1;
+";
+
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -223,6 +235,11 @@ fn init(conn: &Connection) -> Result<()> {
     if version < 5 {
         conn.execute_batch(&format!(
             "BEGIN; {SCHEMA_V5} PRAGMA user_version = 5; COMMIT;"
+        ))?;
+    }
+    if version < 6 {
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V6} PRAGMA user_version = 6; COMMIT;"
         ))?;
     }
     Ok(())
@@ -323,6 +340,76 @@ pub fn upsert_scanned(conn: &Connection, s: &Scanned) -> Result<(i64, bool, bool
             Ok((conn.last_insert_rowid(), true, true))
         }
     }
+}
+
+/// An item whose file turned up at a new path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Moved {
+    pub id: i64,
+    pub title: String,
+}
+
+/// Points items whose file vanished at the files that appeared with the same kind, size and
+/// modified time, which is what `mv` leaves behind. Position, completion, watch history, course
+/// deadlines and review cards move with them. Call before [`upsert_scanned`].
+pub fn relink_moved(conn: &Connection, scanned: &[Scanned]) -> Result<Vec<Moved>> {
+    let present: HashSet<&str> = scanned.iter().map(|s| s.path.as_str()).collect();
+    let mut known: HashSet<String> = HashSet::new();
+    let mut orphans: Vec<(i64, Item)> = Vec::new();
+    for item in items(conn)? {
+        let path = item.path.to_string_lossy().into_owned();
+        if present.contains(path.as_str()) {
+            known.insert(path);
+        } else {
+            orphans.push((item.id, item));
+        }
+    }
+    let mut moved = Vec::new();
+    for s in scanned {
+        if known.contains(&s.path) || s.size == 0 || s.mtime == 0 {
+            continue;
+        }
+        let same =
+            |o: &&(i64, Item)| o.1.kind == s.kind && o.1.size == s.size && o.1.mtime == s.mtime;
+        let candidates: Vec<&(i64, Item)> = orphans.iter().filter(same).collect();
+        let pick = match candidates.as_slice() {
+            [only] => Some(*only),
+            many => {
+                let mut titled = many.iter().filter(|o| o.1.title == s.title);
+                match (titled.next(), titled.next()) {
+                    (Some(one), None) => Some(*one),
+                    _ => None,
+                }
+            }
+        };
+        let Some(&(id, ref old)) = pick else { continue };
+        conn.execute(
+            "UPDATE items SET path = ?2 WHERE id = ?1",
+            params![id, s.path],
+        )?;
+        if old.course_key != s.course_key {
+            conn.execute(
+                "UPDATE OR IGNORE course_plans SET course_key = ?2 WHERE course_key = ?1",
+                params![old.course_key, s.course_key],
+            )?;
+        }
+        // The note moves along with its folder, keeping its name.
+        let note = |dir: &str| format!("{dir}/notes/{}.md", old.title);
+        let (old_note, new_note) = (note(&old.course_dir.to_string_lossy()), note(&s.course_dir));
+        if old_note != new_note {
+            conn.execute(
+                "UPDATE OR IGNORE cards SET note = ?2 WHERE note = ?1",
+                params![old_note, new_note],
+            )?;
+        }
+        moved.push(Moved {
+            id,
+            title: old.title.clone(),
+        });
+        known.insert(s.path.clone());
+        orphans.retain(|o| o.0 != id);
+    }
+    Ok(moved)
 }
 
 pub fn mark_missing_except(conn: &Connection, seen: &[i64]) -> Result<()> {
@@ -488,4 +575,42 @@ pub fn set_holiday(conn: &Connection, date: NaiveDate, on: bool) -> Result<()> {
         conn.execute("DELETE FROM holidays WHERE date = ?1", [date.to_string()])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgrading_to_v6_dates_when_missing_projects_went() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (schema, v) in [
+            (SCHEMA, 1),
+            (SCHEMA_V2, 2),
+            (SCHEMA_V3, 3),
+            (SCHEMA_V4, 4),
+            (SCHEMA_V5, 5),
+        ] {
+            conn.execute_batch(schema).unwrap();
+            conn.pragma_update(None, "user_version", v).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO projects (id, path, name, goal, added, missing) VALUES
+                 (1, '/a', 'a', 1, '2026-01-01', 1), (2, '/b', 'b', 1, '2026-02-03', 1),
+                 (3, '/c', 'c', 1, '2026-01-01', 0);
+             INSERT INTO project_commits VALUES (1, 1767225600 + 86400 * 4);",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        let gone = |id: i64| -> Option<String> {
+            conn.query_row("SELECT gone FROM projects WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        // The day after the last commit; without commits, the day it was added.
+        assert!(gone(1).is_some_and(|g| g.starts_with("2026-01-0")));
+        assert_eq!(gone(2).as_deref(), Some("2026-02-03"));
+        assert_eq!(gone(3), None);
+    }
 }

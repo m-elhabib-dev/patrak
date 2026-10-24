@@ -8,13 +8,19 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// `mpv` with the whole course as a playlist, starting at lecture `start`, so mpv moves on to the
-/// next lecture by itself. mpv resumes the first file from its saved position.
+/// next lecture by itself. mpv resumes the first file from its saved position. Lectures whose
+/// file is gone are left out.
 pub fn play_args(course: &Course, start: usize) -> Vec<OsString> {
+    let start = course.lectures[..start.min(course.lectures.len())]
+        .iter()
+        .filter(|l| !l.missing)
+        .count();
     let mut args: Vec<OsString> = vec!["mpv".into(), format!("--playlist-start={start}").into()];
     args.extend(
         course
             .lectures
             .iter()
+            .filter(|l| !l.missing)
             .map(|l| l.path.clone().into_os_string()),
     );
     args
@@ -89,6 +95,10 @@ pub fn editor_in_terminal_args(cfg: &Config, file: &std::path::Path) -> Vec<OsSt
 pub fn ensure_note(item: &Item) -> std::io::Result<PathBuf> {
     let path = note_path(item);
     if !path.exists() {
+        // Don't bring back the folder of a course that was deleted or moved away.
+        if !item.course_dir.is_dir() {
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }

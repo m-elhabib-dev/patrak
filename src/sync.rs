@@ -34,7 +34,11 @@ pub fn sync(conn: &mut Connection, cfg: &Config, paths: &Paths) -> Result<Report
     let mut seen = Vec::new();
     let mut fresh = HashSet::new();
     let mut to_probe = Vec::new();
-    for s in library::scan(cfg) {
+    let scanned = library::scan(cfg);
+    for moved in db::relink_moved(&tx, &scanned)? {
+        report.changes.push(format!("moved    {}", moved.title));
+    }
+    for s in scanned {
         let (id, is_new, changed) = db::upsert_scanned(&tx, &s)?;
         seen.push(id);
         if is_new {
