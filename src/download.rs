@@ -8,6 +8,7 @@
 //! finishes, so a stopped one, even a single video with no folder of its own, keeps its link.
 
 use crate::config::{self, Config, Paths};
+use crate::db::{self, DownloadRecord, DownloadStatus};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -18,6 +19,8 @@ use std::process::Command;
 pub const SOURCE_FILE: &str = ".patrak-source.json";
 pub const ARCHIVE_FILE: &str = ".patrak-archive.txt";
 const PENDING_FILE: &str = "pending-downloads.json";
+/// How many downloads the history lists.
+const HISTORY_LIMIT: i64 = 200;
 /// File names for a new course: numbered, so lectures sort in playlist order.
 pub const NUMBERED_TEMPLATE: &str = "%(playlist_index)03d - %(title)s.%(ext)s";
 /// File names matching an existing folder downloaded without numbers (yt-download's layout),
@@ -240,7 +243,19 @@ pub fn prepare(paths: &Paths, plan: &Plan) -> Result<()> {
     let mut plans = pending(paths);
     plans.retain(|p| !p.same_download(plan));
     plans.push(plan.clone());
-    save_pending(paths, &plans)
+    save_pending(paths, &plans)?;
+    record(paths, |conn| {
+        let course = plan.source.is_some();
+        db::download_started(
+            conn,
+            &plan.url,
+            &plan.dir,
+            &plan.title,
+            course,
+            config::now(),
+        )
+    });
+    Ok(())
 }
 
 /// Called after a successful download: nothing is new any more.
@@ -250,7 +265,58 @@ pub fn finish(paths: &Paths, plan: &Plan) -> Result<()> {
         source.new_titles.clear();
         source.save(&plan.dir)?;
     }
+    record_end(paths, plan, DownloadStatus::Finished, None);
     forget(paths, plan)
+}
+
+/// Called when yt-dlp was stopped or failed. It stays pending, to be resumed.
+pub fn stopped(paths: &Paths, plan: &Plan) {
+    record_end(paths, plan, DownloadStatus::Stopped, None);
+}
+
+/// See [`stopped`].
+pub fn failed(paths: &Paths, plan: &Plan, error: &str) {
+    record_end(paths, plan, DownloadStatus::Failed, Some(error));
+}
+
+/// Called when a URL couldn't be looked up, so there's nothing to resume.
+pub fn lookup_failed(paths: &Paths, url: &str, error: &str) {
+    record(paths, |conn| {
+        db::download_lookup_failed(conn, url, error, config::now())
+    });
+}
+
+fn record_end(paths: &Paths, plan: &Plan, status: DownloadStatus, error: Option<&str>) {
+    record(paths, |conn| {
+        db::download_ended(conn, &plan.url, &plan.dir, status, error, config::now())
+    });
+}
+
+/// The history is a nicety: failing to write it doesn't stop a download.
+fn record(paths: &Paths, write: impl FnOnce(&rusqlite::Connection) -> Result<()>) {
+    if let Err(e) = db::open(&paths.db()).and_then(|conn| write(&conn)) {
+        eprintln!("download history: {e:#}");
+    }
+}
+
+/// Past downloads, newest first. Unfinished ones are left out while they can be resumed, since
+/// they aren't history yet.
+pub fn history(paths: &Paths) -> Result<Vec<DownloadRecord>> {
+    let pending = pending(paths);
+    let conn = db::open(&paths.db())?;
+    let mut records = db::download_history(&conn, HISTORY_LIMIT)?;
+    records.retain(|r| {
+        r.status == DownloadStatus::Finished
+            || !pending
+                .iter()
+                .any(|p| p.url == r.url && r.dir.as_ref() == Some(&p.dir))
+    });
+    Ok(records)
+}
+
+/// Removes downloads from the history. Their files stay.
+pub fn remove_from_history(paths: &Paths, ids: &[i64]) -> Result<()> {
+    db::delete_downloads(&db::open(&paths.db())?, ids)
 }
 
 /// Downloads that were started and haven't finished, oldest first.
@@ -459,6 +525,26 @@ mod tests {
         prepare(&paths, &video).unwrap();
         std::fs::remove_dir_all(&course.dir).unwrap();
         assert_eq!(urls(), ["https://y/video"]);
+
+        // History: the finished video stays listed while it's downloaded again; the course that
+        // can't be resumed any more is listed as it ended.
+        let titles = || -> Vec<(String, DownloadStatus)> {
+            let records = history(&paths).unwrap();
+            records.into_iter().map(|r| (r.title, r.status)).collect()
+        };
+        assert_eq!(titles().len(), 2);
+        assert!(titles().contains(&("Talk".to_owned(), DownloadStatus::Finished)));
+        assert!(titles().contains(&("Rust".to_owned(), DownloadStatus::Running)));
+        // Stopped and still resumable: not history yet, and forgetting it makes it so.
+        stopped(&paths, &video);
+        assert_eq!(titles().len(), 2);
+        forget(&paths, &video).unwrap();
+        assert_eq!(titles().len(), 3);
+        assert!(titles().contains(&("Talk".to_owned(), DownloadStatus::Stopped)));
+
+        let ids: Vec<i64> = history(&paths).unwrap().iter().map(|r| r.id).collect();
+        remove_from_history(&paths, &ids).unwrap();
+        assert!(titles().is_empty());
     }
 
     #[test]

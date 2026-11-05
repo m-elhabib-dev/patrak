@@ -780,6 +780,7 @@ pub fn add(url: String, name: Option<String>) -> Result<()> {
     println!("Downloading {}", bold(&plan.describe()));
     download::prepare(&session.paths, &plan)?;
     if !run(download::download_args(&session.cfg, &plan, false))? {
+        download::stopped(&session.paths, &plan);
         bail!("download stopped; run `patrak update` to resume it");
     }
     download::finish(&session.paths, &plan)?;
@@ -816,9 +817,15 @@ pub fn update(query: Option<String>, check_only: bool) -> Result<()> {
     let mut downloaded = false;
     for plan in &videos {
         println!("{}  {}", bold(&plan.title), green("not finished"));
-        if !check_only && run(download::download_args(&session.cfg, plan, false))? {
+        if check_only {
+            continue;
+        }
+        download::prepare(&session.paths, plan)?;
+        if run(download::download_args(&session.cfg, plan, false))? {
             download::finish(&session.paths, plan)?;
             downloaded = true;
+        } else {
+            download::stopped(&session.paths, plan);
         }
     }
     for dir in dirs {
@@ -840,9 +847,12 @@ pub fn update(query: Option<String>, check_only: bool) -> Result<()> {
             continue;
         }
         let plan = download::update_plan(&dir).context("course has no source")?;
+        download::prepare(&session.paths, &plan)?;
         if run(download::download_args(&session.cfg, &plan, false))? {
             download::finish(&session.paths, &plan)?;
             downloaded = true;
+        } else {
+            download::stopped(&session.paths, &plan);
         }
     }
     if downloaded {

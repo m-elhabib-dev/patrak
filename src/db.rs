@@ -193,6 +193,21 @@ UPDATE projects SET gone = COALESCE(
 WHERE missing = 1;
 ";
 
+/// Version 7: what was downloaded and how it went. `dir` is empty when the URL's lookup failed.
+const SCHEMA_V7: &str = "
+CREATE TABLE downloads (
+    id         INTEGER PRIMARY KEY,
+    url        TEXT    NOT NULL,
+    dir        TEXT,
+    title      TEXT    NOT NULL,
+    course     INTEGER NOT NULL DEFAULT 0,
+    status     TEXT    NOT NULL,
+    error      TEXT,
+    started_at INTEGER NOT NULL,
+    ended_at   INTEGER
+);
+";
+
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -240,6 +255,11 @@ fn init(conn: &Connection) -> Result<()> {
     if version < 6 {
         conn.execute_batch(&format!(
             "BEGIN; {SCHEMA_V6} PRAGMA user_version = 6; COMMIT;"
+        ))?;
+    }
+    if version < 7 {
+        conn.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V7} PRAGMA user_version = 7; COMMIT;"
         ))?;
     }
     Ok(())
@@ -577,9 +597,179 @@ pub fn set_holiday(conn: &Connection, date: NaiveDate, on: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadStatus {
+    /// Started and not known to have ended: yt-dlp is running, or the app died under it.
+    Running,
+    Stopped,
+    Failed,
+    Finished,
+}
+
+impl DownloadStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            DownloadStatus::Running => "running",
+            DownloadStatus::Stopped => "stopped",
+            DownloadStatus::Failed => "failed",
+            DownloadStatus::Finished => "finished",
+        }
+    }
+}
+
+/// One download in the history. Stopping and resuming it stays one record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownloadRecord {
+    pub id: i64,
+    pub url: String,
+    /// `None` when the URL's lookup failed, before there was anywhere to download to.
+    pub dir: Option<PathBuf>,
+    pub title: String,
+    /// A playlist with its own folder, rather than a single video.
+    pub course: bool,
+    pub status: DownloadStatus,
+    pub error: Option<String>,
+    /// When it ended, or started if it hasn't.
+    pub at: i64,
+}
+
+/// Records a download starting, continuing its record if it never finished.
+pub fn download_started(
+    conn: &Connection,
+    url: &str,
+    dir: &Path,
+    title: &str,
+    course: bool,
+    now: i64,
+) -> Result<()> {
+    let dir = dir.to_string_lossy();
+    let continued = conn.execute(
+        "UPDATE downloads SET title = ?3, course = ?4, status = 'running', error = NULL,
+             ended_at = NULL
+         WHERE id = (SELECT MAX(id) FROM downloads
+                     WHERE url = ?1 AND dir = ?2 AND status != 'finished')",
+        params![url, dir, title, course],
+    )?;
+    if continued == 0 {
+        conn.execute(
+            "INSERT INTO downloads (url, dir, title, course, status, started_at)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
+            params![url, dir, title, course, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Records how a download ended.
+pub fn download_ended(
+    conn: &Connection,
+    url: &str,
+    dir: &Path,
+    status: DownloadStatus,
+    error: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE downloads SET status = ?3, error = ?4, ended_at = ?5
+         WHERE id = (SELECT MAX(id) FROM downloads
+                     WHERE url = ?1 AND dir = ?2 AND status != 'finished')",
+        params![url, dir.to_string_lossy(), status.as_str(), error, now],
+    )?;
+    Ok(())
+}
+
+/// Records a URL that couldn't be looked up.
+pub fn download_lookup_failed(conn: &Connection, url: &str, error: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO downloads (url, title, status, error, started_at, ended_at)
+         VALUES (?1, ?1, 'failed', ?2, ?3, ?3)",
+        params![url, error, now],
+    )?;
+    Ok(())
+}
+
+/// The latest downloads, newest first.
+pub fn download_history(conn: &Connection, limit: i64) -> Result<Vec<DownloadRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, url, dir, title, course, status, error, COALESCE(ended_at, started_at) AS at
+         FROM downloads ORDER BY at DESC, id DESC LIMIT ?1",
+    )?;
+    let records = stmt.query_map([limit], |r| {
+        let dir: Option<String> = r.get(2)?;
+        let status: String = r.get(5)?;
+        Ok(DownloadRecord {
+            id: r.get(0)?,
+            url: r.get(1)?,
+            dir: dir.map(PathBuf::from),
+            title: r.get(3)?,
+            course: r.get(4)?,
+            status: match status.as_str() {
+                "finished" => DownloadStatus::Finished,
+                "failed" => DownloadStatus::Failed,
+                "stopped" => DownloadStatus::Stopped,
+                _ => DownloadStatus::Running,
+            },
+            error: r.get(6)?,
+            at: r.get(7)?,
+        })
+    })?;
+    Ok(records.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn delete_downloads(conn: &Connection, ids: &[i64]) -> Result<()> {
+    for id in ids {
+        conn.execute("DELETE FROM downloads WHERE id = ?1", [id])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_history_keeps_one_record_until_finished() {
+        let conn = open_in_memory().unwrap();
+        let dir = Path::new("/v/Rust");
+        let list = |conn: &Connection| download_history(conn, 10).unwrap();
+
+        download_started(&conn, "u", dir, "Rust", true, 100).unwrap();
+        download_ended(&conn, "u", dir, DownloadStatus::Stopped, None, 110).unwrap();
+        assert_eq!(list(&conn)[0].status, DownloadStatus::Stopped);
+        assert_eq!(list(&conn)[0].at, 110);
+
+        // Resuming continues the record, whether it was stopped or failed.
+        download_started(&conn, "u", dir, "Rust", true, 120).unwrap();
+        assert_eq!(list(&conn).len(), 1);
+        assert_eq!(list(&conn)[0].status, DownloadStatus::Running);
+        download_ended(&conn, "u", dir, DownloadStatus::Failed, Some("403"), 130).unwrap();
+        assert_eq!(list(&conn)[0].error.as_deref(), Some("403"));
+        download_started(&conn, "u", dir, "Rust", true, 140).unwrap();
+        assert_eq!(list(&conn)[0].error, None);
+        download_ended(&conn, "u", dir, DownloadStatus::Finished, None, 150).unwrap();
+
+        // Downloading it again later is a new record, and the finished one stays as it was.
+        download_started(&conn, "u", dir, "Rust", true, 200).unwrap();
+        let records = list(&conn);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].status, DownloadStatus::Running);
+        assert_eq!(
+            (records[1].status, records[1].at),
+            (DownloadStatus::Finished, 150)
+        );
+        assert!(records[1].course);
+
+        // The same link in another folder is a separate download.
+        download_started(&conn, "u", Path::new("/v/Other"), "Other", true, 210).unwrap();
+        assert_eq!(list(&conn).len(), 3);
+
+        download_lookup_failed(&conn, "bad", "no such video", 300).unwrap();
+        let failed = list(&conn).remove(0);
+        assert_eq!((failed.title.as_str(), failed.dir), ("bad", None));
+
+        delete_downloads(&conn, &[failed.id]).unwrap();
+        assert_eq!(list(&conn).len(), 3);
+    }
 
     #[test]
     fn upgrading_to_v6_dates_when_missing_projects_went() {

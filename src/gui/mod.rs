@@ -1,6 +1,7 @@
 mod books;
 mod courses;
 mod download_dialog;
+mod download_history;
 mod habit_dialog;
 mod habits;
 mod notes;
@@ -73,6 +74,15 @@ pub enum Action {
     CheckCourse(PathBuf),
     /// Download new episodes of a downloaded course.
     UpdateCourse(PathBuf),
+    /// Fetch a past download again; `course` is its folder if it has one.
+    DownloadAgain {
+        url: String,
+        course: Option<PathBuf>,
+    },
+    RemoveDownload(i64),
+    ClearDownloads,
+    StopAllDownloads,
+    ResumeAllDownloads,
     OpenUrl(String),
 }
 
@@ -92,13 +102,16 @@ levelbar.goal block { min-height: 14px; border-radius: 7px; }
 ";
 
 /// Loaded above the user's own gtk.css, whose `button:checked` would otherwise paint the
-/// holiday button in the theme's accent colour.
+/// holiday button in the theme's accent colour. The tabs are also tighter, so all seven labels
+/// fit at the default window width.
 const HOLIDAY_CSS: &str = "
 button.holiday:checked { background-color: @purple_3; color: white; }
 button.holiday:checked:hover { background-color: shade(@purple_3, 1.1); }
+viewswitcher button.toggle > stack > box.wide { padding-left: 6px; padding-right: 6px; border-spacing: 4px; }
 ";
 
-/// Opens the window, showing `page` (today, courses, books, projects, habits or stats) if given.
+/// Opens the window, showing `page` (today, courses, books, projects, habits, stats or downloads)
+/// if given.
 pub fn run(page: Option<String>) {
     let app = adw::Application::builder()
         .application_id(setup::APP_ID)
@@ -173,6 +186,7 @@ impl App {
             let projects = projects::ProjectsPage::new(act.clone());
             let habits = habits::HabitsPage::new(act.clone());
             let stats = stats::StatsPage::new();
+            let downloads = download_dialog::Downloads::new(act.clone());
 
             let stack = adw::ViewStack::new();
             stack.add_titled_with_icon(&today.root, Some("today"), "Today", "starred-symbolic");
@@ -205,6 +219,12 @@ impl App {
                 Some("stats"),
                 "Stats",
                 "x-office-spreadsheet-symbolic",
+            );
+            stack.add_titled_with_icon(
+                &downloads.root,
+                Some("downloads"),
+                "Downloads",
+                "folder-download-symbolic",
             );
 
             let switcher = adw::ViewSwitcher::builder()
@@ -245,7 +265,6 @@ impl App {
             header.set_title_widget(Some(&switcher));
             header.pack_start(&add);
             header.pack_start(&refresh);
-            let downloads = download_dialog::Downloads::new();
             header.pack_end(&menu_button);
             header.pack_end(&holiday_button);
             header.pack_end(&downloads.button);
@@ -267,20 +286,26 @@ impl App {
             let window = adw::ApplicationWindow::builder()
                 .application(gtk_app)
                 .title("patrak")
-                .default_width(1100)
+                .default_width(1280)
                 .default_height(760)
                 .width_request(360)
                 .height_request(400)
                 .content(&toasts)
                 .build();
 
-            let narrow = adw::Breakpoint::new(
-                adw::BreakpointCondition::parse("max-width: 700sp").expect("valid breakpoint"),
-            );
-            narrow.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
-            narrow.add_setter(&switcher, "visible", Some(&false.to_value()));
-            narrow.add_setter(&courses.root, "collapsed", Some(&true.to_value()));
-            window.add_breakpoint(narrow);
+            // The tabs need more room than the pages do. The last matching breakpoint wins.
+            for (width, collapse_courses) in [(900, false), (700, true)] {
+                let narrow = adw::Breakpoint::new(
+                    adw::BreakpointCondition::parse(&format!("max-width: {width}sp"))
+                        .expect("valid breakpoint"),
+                );
+                narrow.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
+                narrow.add_setter(&switcher, "visible", Some(&false.to_value()));
+                if collapse_courses {
+                    narrow.add_setter(&courses.root, "collapsed", Some(&true.to_value()));
+                }
+                window.add_breakpoint(narrow);
+            }
 
             App {
                 window,
@@ -380,6 +405,7 @@ impl App {
         add("preferences", &["<Control>comma"], prefs::show);
         add("about", &[], |app| app.show_about());
         add("add-course", &["<Control>n"], download_dialog::show_add);
+        add("show-downloads", &[], App::show_downloads);
         add("quit", &["<Control>q"], |app| app.window.close());
 
         let weak = Rc::downgrade(self);
@@ -504,6 +530,13 @@ impl App {
             }
             Action::CheckCourse(dir) => self.check_sources(vec![dir], true),
             Action::UpdateCourse(dir) => download_dialog::show_update(self, dir),
+            Action::DownloadAgain { url, course } => {
+                download_dialog::download_again(self, &url, course);
+            }
+            Action::RemoveDownload(id) => download_dialog::remove_from_history(self, &[id]),
+            Action::ClearDownloads => download_dialog::confirm_clear_history(self),
+            Action::StopAllDownloads => self.downloads.stop_all(),
+            Action::ResumeAllDownloads => download_dialog::resume_all(self),
             Action::OpenUrl(url) => {
                 gtk::UriLauncher::new(&url).launch(
                     Some(&self.window),
@@ -512,6 +545,10 @@ impl App {
                 );
             }
         }
+    }
+
+    fn show_downloads(self: &Rc<Self>) {
+        self.stack.set_visible_child_name("downloads");
     }
 
     /// Starts an external program and resyncs when it exits.
@@ -580,6 +617,8 @@ impl App {
     }
 
     fn apply(self: &Rc<Self>, report: Report, snap: Snapshot) {
+        // Not part of the snapshot, and `patrak add` may have changed it.
+        self.downloads.reload_history(&self.paths);
         for title in &report.completed {
             self.toast(&format!("Finished “{}”", widgets::isolate(title)));
         }
@@ -736,7 +775,7 @@ impl App {
         let alert = adw::AlertDialog::new(
             Some("Stop Downloads?"),
             Some(&format!(
-                "{what} still running. What’s downloaded so far is kept, and you can resume it from the downloads button."
+                "{what} still running. What’s downloaded so far is kept, and you can resume it from the Downloads page."
             )),
         );
         alert.add_responses(&[("cancel", "Keep Downloading"), ("quit", "Stop and Quit")]);

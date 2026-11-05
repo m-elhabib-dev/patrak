@@ -19,8 +19,8 @@ struct Args {
 enum Cmd {
     /// Open the window (the default when no command is given)
     Gui {
-        /// Page to open: today, courses, books, projects, habits or stats
-        #[arg(long, value_parser = ["today", "courses", "books", "projects", "habits", "stats"])]
+        /// Page to open: today, courses, books, projects, habits, stats or downloads
+        #[arg(long, value_parser = ["today", "courses", "books", "projects", "habits", "stats", "downloads"])]
         page: Option<String>,
     },
     /// Today's minutes and pages against the daily goals, and what's next

@@ -159,8 +159,10 @@ patrak update --check                                   # only list what's new
 - Each folder gets two hidden files: `.patrak-source.json` and `.patrak-archive.txt`, the record
   of downloaded videos. Moving the folder keeps the link.
 - The window checks each playlist for new episodes about once a day.
-- Stopping a download keeps its link and partial files. Unfinished downloads stay in the header's
-  downloads list, even after a restart, and Resume continues them where they left off.
+- The Downloads page shows what's in progress and a history of past downloads. From the history you
+  can open a download's folder or link, download it again, or remove it; its files stay.
+- Stopping a download keeps its link and partial files. Unfinished downloads stay on the Downloads
+  page, even after a restart, and Resume continues them where they left off.
 
 yt-dlp options come from `yt_dlp` and `yt_dlp_args` in `config.toml`. If YouTube refuses downloads
 (HTTP 403), update yt-dlp or add browser cookies:
