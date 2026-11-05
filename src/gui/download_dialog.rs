@@ -10,12 +10,16 @@ use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 /// yt-dlp stops cleanly on SIGINT, keeping partial files to resume from.
 const SIGINT: i32 = 2;
 
 /// How many lines of yt-dlp output a download's log keeps.
 const LOG_LINES: i32 = 1000;
+
+/// How often a running download's progress is saved, so a crash loses little of it.
+const SAVE_PROGRESS_EVERY: Duration = Duration::from_secs(3);
 
 /// Asks for a playlist URL, then downloads it as a new course.
 pub fn show_add(app: &Rc<App>) {
@@ -257,9 +261,16 @@ fn run(app: &Rc<App>, plan: Plan, job: Rc<Job>) {
     let paths = app.paths.clone();
     glib::spawn_future_local(async move {
         let mut tail = VecDeque::new();
+        let mut latest = None;
+        let mut saved_at = Instant::now();
         while let Ok(Some(line)) = reader.read_line_utf8_future(glib::Priority::DEFAULT).await {
             if let Some(progress) = download::parse_progress(&line) {
                 job.progress(&progress);
+                if saved_at.elapsed() >= SAVE_PROGRESS_EVERY {
+                    save_progress(&paths, &plan, &progress);
+                    saved_at = Instant::now();
+                }
+                latest = Some(progress);
                 continue;
             }
             let line = line.trim();
@@ -279,12 +290,21 @@ fn run(app: &Rc<App>, plan: Plan, job: Rc<Job>) {
             if let Err(e) = download::finish(&paths, &plan) {
                 eprintln!("updating {}: {e:#}", plan.dir.display());
             }
+        } else if let Some(progress) = &latest {
+            save_progress(&paths, &plan, progress);
         }
         if let Some(app) = weak.upgrade() {
             let failure = (!ok).then(|| Vec::from(tail).join("\n"));
             ended(&app, &job, &plan.title, failure);
         }
     });
+}
+
+/// Progress only decorates a stopped download, so failing to save it doesn't stop anything.
+fn save_progress(paths: &Paths, plan: &Plan, progress: &Progress) {
+    if let Err(e) = download::save_progress(paths, plan, progress) {
+        eprintln!("saving progress of {}: {e:#}", plan.url);
+    }
 }
 
 /// Shows how a download ended, in its view and as a toast, and records it.
@@ -880,7 +900,10 @@ impl Job {
 
     /// A download left unfinished by an earlier run of the app.
     fn restored(&self, plan: Plan) {
-        self.status.set_label(&plan.dir.display().to_string());
+        match &plan.progress {
+            Some(progress) => self.progress(progress),
+            None => self.status.set_label(&plan.dir.display().to_string()),
+        }
         if plan.source.is_some() {
             *self.dir.borrow_mut() = Some(plan.dir.clone());
         }

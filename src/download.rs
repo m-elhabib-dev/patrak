@@ -64,6 +64,9 @@ pub struct Plan {
     pub videos: usize,
     /// `None` for a single video, which has nothing to update later.
     pub source: Option<Source>,
+    /// How far it had got when last saved, to show until it's resumed.
+    #[serde(default)]
+    pub progress: Option<Progress>,
 }
 
 impl Plan {
@@ -119,6 +122,7 @@ pub fn plan(cfg: &Config, url: &str, name: Option<&str>) -> Result<Plan> {
             title,
             videos: 1,
             source: None,
+            progress: None,
         });
     }
     let folder = match name {
@@ -144,6 +148,7 @@ pub fn plan(cfg: &Config, url: &str, name: Option<&str>) -> Result<Plan> {
         title,
         videos: info.entries.len(),
         source: Some(source),
+        progress: None,
     })
 }
 
@@ -231,6 +236,7 @@ pub fn update_plan(dir: &Path) -> Option<Plan> {
         title,
         videos: source.new_titles.len(),
         source: Some(source),
+        progress: None,
     })
 }
 
@@ -241,8 +247,16 @@ pub fn prepare(paths: &Paths, plan: &Plan) -> Result<()> {
         source.save(&plan.dir)?;
     }
     let mut plans = pending(paths);
+    // Resuming doesn't lose how far it got, in case it's stopped again before making progress.
+    let progress = plans
+        .iter()
+        .find(|p| p.same_download(plan))
+        .and_then(|p| p.progress.clone());
     plans.retain(|p| !p.same_download(plan));
-    plans.push(plan.clone());
+    plans.push(Plan {
+        progress,
+        ..plan.clone()
+    });
     save_pending(paths, &plans)?;
     record(paths, |conn| {
         let course = plan.source.is_some();
@@ -329,6 +343,16 @@ pub fn pending(paths: &Paths) -> Vec<Plan> {
         .collect()
 }
 
+/// Saves how far a download has got. Does nothing once it has finished or been forgotten.
+pub fn save_progress(paths: &Paths, plan: &Plan, progress: &Progress) -> Result<()> {
+    let mut plans = pending(paths);
+    let Some(entry) = plans.iter_mut().find(|p| p.same_download(plan)) else {
+        return Ok(());
+    };
+    entry.progress = Some(progress.clone());
+    save_pending(paths, &plans)
+}
+
 /// Stops offering to resume a download. Its files stay.
 pub fn forget(paths: &Paths, plan: &Plan) -> Result<()> {
     let mut plans = pending(paths);
@@ -403,7 +427,7 @@ fn yt_dlp(cfg: &Config, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Progress {
     /// 0..1 for the current video.
     pub fraction: Option<f64>,
@@ -489,6 +513,7 @@ mod tests {
             title: "Talk".into(),
             videos: 1,
             source: None,
+            progress: None,
         };
         let course = Plan {
             url: "https://y/list".into(),
@@ -501,6 +526,7 @@ mod tests {
                 checked_at: None,
                 new_titles: vec![],
             }),
+            progress: None,
         };
         let urls = || -> Vec<String> { pending(&paths).into_iter().map(|p| p.url).collect() };
         assert!(urls().is_empty());
@@ -548,6 +574,45 @@ mod tests {
     }
 
     #[test]
+    fn saves_progress_until_the_download_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            events_log: tmp.path().join("events.log"),
+        };
+        let video = Plan {
+            url: "https://y/video".into(),
+            dir: tmp.path().join("videos"),
+            title: "Talk".into(),
+            videos: 1,
+            source: None,
+            progress: None,
+        };
+        let saved = || pending(&paths).pop().and_then(|p| p.progress);
+        let progress = parse_progress("[patrak] 512|1024|NA|NA|Talk").unwrap();
+
+        prepare(&paths, &video).unwrap();
+        assert_eq!(saved(), None);
+        save_progress(&paths, &video, &progress).unwrap();
+        assert_eq!(saved().as_ref(), Some(&progress));
+
+        // Resuming keeps it until there's newer progress.
+        prepare(&paths, &video).unwrap();
+        assert_eq!(saved().as_ref(), Some(&progress));
+
+        // A late save doesn't bring a finished download back.
+        finish(&paths, &video).unwrap();
+        save_progress(&paths, &video, &progress).unwrap();
+        assert!(pending(&paths).is_empty());
+
+        // Lists written before progress was saved still load.
+        let old = r#"[{"url":"u","dir":"/v","title":"t","videos":1,"source":null}]"#;
+        std::fs::write(paths.data_dir.join(PENDING_FILE), old).unwrap();
+        assert_eq!(pending(&paths)[0].progress, None);
+    }
+
+    #[test]
     fn builds_download_command() {
         let cfg = Config {
             yt_dlp_args: vec!["-S".into(), "res:720".into()],
@@ -565,6 +630,7 @@ mod tests {
             title: "Rust".into(),
             videos: 3,
             source: Some(source),
+            progress: None,
         };
         let args: Vec<String> = download_args(&cfg, &plan, false)
             .iter()
