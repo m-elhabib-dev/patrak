@@ -48,7 +48,7 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Download new episodes of courses added with `patrak add`
+    /// Download new episodes of courses added with `patrak add`, and resume stopped downloads
     Update {
         /// Only courses whose name contains this
         query: Option<String>,

@@ -3,8 +3,11 @@
 //! A downloaded course folder holds two hidden files, so the link survives moving the folder:
 //! `.patrak-source.json` (the playlist URL and file name template) and `.patrak-archive.txt`
 //! (yt-dlp's record of downloaded videos, so updates only fetch new episodes).
+//!
+//! Every download is also listed in `pending-downloads.json` in the data directory until it
+//! finishes, so a stopped one, even a single video with no folder of its own, keeps its link.
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Paths};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -14,6 +17,7 @@ use std::process::Command;
 
 pub const SOURCE_FILE: &str = ".patrak-source.json";
 pub const ARCHIVE_FILE: &str = ".patrak-archive.txt";
+const PENDING_FILE: &str = "pending-downloads.json";
 /// File names for a new course: numbered, so lectures sort in playlist order.
 pub const NUMBERED_TEMPLATE: &str = "%(playlist_index)03d - %(title)s.%(ext)s";
 /// File names matching an existing folder downloaded without numbers (yt-download's layout),
@@ -48,7 +52,7 @@ impl Source {
 }
 
 /// Where a URL will be downloaded and how.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub url: String,
     /// The course folder, or the video folder itself for a single video.
@@ -60,6 +64,11 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Whether both download the same URL to the same place.
+    pub fn same_download(&self, other: &Plan) -> bool {
+        self.url == other.url && self.dir == other.dir
+    }
+
     pub fn template(&self) -> &str {
         self.source.as_ref().map_or(TITLE_TEMPLATE, |s| &s.template)
     }
@@ -122,7 +131,8 @@ pub fn plan(cfg: &Config, url: &str, name: Option<&str>) -> Result<Plan> {
     let source = Source {
         url: url.into(),
         template,
-        checked_at: Some(config::now()),
+        // Not known to be complete until `finish`, so Download New works after a stop.
+        checked_at: None,
         new_titles: Vec::new(),
     };
     Ok(Plan {
@@ -221,24 +231,59 @@ pub fn update_plan(dir: &Path) -> Option<Plan> {
     })
 }
 
-/// Saves the source file before downloading, so an interrupted download can be resumed with
-/// `patrak update`.
-pub fn prepare(plan: &Plan) -> Result<()> {
+/// Records the link before downloading, so an interrupted download can be resumed.
+pub fn prepare(paths: &Paths, plan: &Plan) -> Result<()> {
     std::fs::create_dir_all(&plan.dir)?;
     if let Some(source) = &plan.source {
         source.save(&plan.dir)?;
     }
-    Ok(())
+    let mut plans = pending(paths);
+    plans.retain(|p| !p.same_download(plan));
+    plans.push(plan.clone());
+    save_pending(paths, &plans)
 }
 
 /// Called after a successful download: nothing is new any more.
-pub fn finish(plan: &Plan) -> Result<()> {
+pub fn finish(paths: &Paths, plan: &Plan) -> Result<()> {
     if let Some(mut source) = Source::load(&plan.dir) {
         source.checked_at = Some(config::now());
         source.new_titles.clear();
         source.save(&plan.dir)?;
     }
-    Ok(())
+    forget(paths, plan)
+}
+
+/// Downloads that were started and haven't finished, oldest first.
+pub fn pending(paths: &Paths) -> Vec<Plan> {
+    let text = std::fs::read_to_string(paths.data_dir.join(PENDING_FILE)).unwrap_or_default();
+    serde_json::from_str::<Vec<Plan>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(refreshed)
+        .collect()
+}
+
+/// Stops offering to resume a download. Its files stay.
+pub fn forget(paths: &Paths, plan: &Plan) -> Result<()> {
+    let mut plans = pending(paths);
+    plans.retain(|p| !p.same_download(plan));
+    save_pending(paths, &plans)
+}
+
+/// `plan` with its course's current source. `None` if the course folder is gone; if it was
+/// moved, its source file went with it and Download New still works there.
+pub fn refreshed(mut plan: Plan) -> Option<Plan> {
+    if plan.source.is_some() {
+        plan.source = Some(Source::load(&plan.dir)?);
+    }
+    Some(plan)
+}
+
+fn save_pending(paths: &Paths, plans: &[Plan]) -> Result<()> {
+    std::fs::create_dir_all(&paths.data_dir)?;
+    let file = paths.data_dir.join(PENDING_FILE);
+    std::fs::write(&file, serde_json::to_string_pretty(plans)?)
+        .with_context(|| format!("writing {}", file.display()))
 }
 
 /// Asks the playlist which episodes aren't downloaded yet and records the answer.
@@ -362,6 +407,58 @@ mod tests {
         let single = parse_progress("[patrak] 100|NA|NA|NA|Talk").unwrap();
         assert_eq!((single.fraction, single.overall()), (None, None));
         assert!(parse_progress("[download] Destination: x.mp4").is_none());
+    }
+
+    #[test]
+    fn remembers_downloads_until_they_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            events_log: tmp.path().join("events.log"),
+        };
+        let video = Plan {
+            url: "https://y/video".into(),
+            dir: tmp.path().join("videos"),
+            title: "Talk".into(),
+            videos: 1,
+            source: None,
+        };
+        let course = Plan {
+            url: "https://y/list".into(),
+            dir: tmp.path().join("videos/Rust"),
+            title: "Rust".into(),
+            videos: 3,
+            source: Some(Source {
+                url: "https://y/list".into(),
+                template: NUMBERED_TEMPLATE.into(),
+                checked_at: None,
+                new_titles: vec![],
+            }),
+        };
+        let urls = || -> Vec<String> { pending(&paths).into_iter().map(|p| p.url).collect() };
+        assert!(urls().is_empty());
+
+        prepare(&paths, &video).unwrap();
+        prepare(&paths, &course).unwrap();
+        // Starting one again doesn't list it twice.
+        prepare(&paths, &video).unwrap();
+        assert_eq!(urls(), ["https://y/list", "https://y/video"]);
+
+        // A course keeps its link in its folder, and a check there isn't overwritten.
+        let mut checked = Source::load(&course.dir).unwrap();
+        checked.new_titles = vec!["Episode 2".into()];
+        checked.save(&course.dir).unwrap();
+        let listed = pending(&paths).remove(0);
+        assert_eq!(listed.source.unwrap().new_titles, ["Episode 2"]);
+
+        finish(&paths, &video).unwrap();
+        assert_eq!(urls(), ["https://y/list"]);
+
+        // A course folder that's gone can't be resumed; a single video needs no folder.
+        prepare(&paths, &video).unwrap();
+        std::fs::remove_dir_all(&course.dir).unwrap();
+        assert_eq!(urls(), ["https://y/video"]);
     }
 
     #[test]

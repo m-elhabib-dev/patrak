@@ -57,7 +57,7 @@ pub fn show_add(app: &Rc<App>) {
     form.append(&group);
     form.append(&start);
 
-    let job = Job::new();
+    let job = Job::new(app);
     let stack = gtk::Stack::new();
     stack.add_named(&form, Some("form"));
     stack.add_named(&job.page, Some("progress"));
@@ -96,6 +96,30 @@ pub fn show_add(app: &Rc<App>) {
     });
 }
 
+/// Lists the downloads that were still unfinished when the app last closed.
+pub fn restore(app: &Rc<App>) {
+    for plan in download::pending(&app.paths) {
+        let job = Job::new(app);
+        job.restored(plan);
+        app.downloads.jobs.borrow_mut().push(job.clone());
+        app.downloads.adopt(app, &job);
+    }
+}
+
+/// Continues a stopped or failed download where it left off.
+fn resume(app: &Rc<App>, job: &Rc<Job>) {
+    let Some(plan) = job.plan.borrow().clone() else {
+        return;
+    };
+    let Some(plan) = download::refreshed(plan) else {
+        app.toast("The course folder has moved; use Download New there");
+        return app.downloads.dismiss(app, job);
+    };
+    job.resuming();
+    app.downloads.begin(job);
+    run(app, plan, job.clone());
+}
+
 /// Downloads the new episodes of a course added earlier.
 pub fn show_update(app: &Rc<App>, dir: PathBuf) {
     let Some(plan) = download::update_plan(&dir) else {
@@ -106,7 +130,7 @@ pub fn show_update(app: &Rc<App>, dir: PathBuf) {
         app.toast(&format!("Already downloading {}", isolate(&plan.title)));
         return app.downloads.button.popup();
     }
-    let job = Job::new();
+    let job = Job::new(app);
     open(
         app,
         &format!("Updating {}", isolate(&plan.title)),
@@ -138,7 +162,7 @@ fn open(app: &Rc<App>, title: &str, child: &impl IsA<gtk::Widget>, job: &Rc<Job>
     let (weak, job) = (Rc::downgrade(app), job.clone());
     dialog.connect_closed(move |_| {
         if let Some(app) = weak.upgrade()
-            && job.working.get()
+            && (job.working.get() || job.can_resume())
         {
             app.downloads.adopt(&app, &job);
         }
@@ -151,7 +175,9 @@ fn run(app: &Rc<App>, plan: Plan, job: Rc<Job>) {
     if plan.source.is_some() {
         *job.dir.borrow_mut() = Some(plan.dir.clone());
     }
-    if let Err(e) = download::prepare(&plan) {
+    *job.plan.borrow_mut() = Some(plan.clone());
+    app.downloads.replace_idle(&job);
+    if let Err(e) = download::prepare(&app.paths, &plan) {
         return ended(app, &job, &plan.title, Some(format!("{e:#}")));
     }
     let args = download::download_args(&app.cfg.borrow(), &plan, true);
@@ -170,6 +196,7 @@ fn run(app: &Rc<App>, plan: Plan, job: Rc<Job>) {
     job.started(&plan, &process);
     let reader = gio::DataInputStream::new(&stdout);
     let weak = Rc::downgrade(app);
+    let paths = app.paths.clone();
     glib::spawn_future_local(async move {
         let mut tail = VecDeque::new();
         while let Ok(Some(line)) = reader.read_line_utf8_future(glib::Priority::DEFAULT).await {
@@ -188,8 +215,12 @@ fn run(app: &Rc<App>, plan: Plan, job: Rc<Job>) {
             }
         }
         let ok = process.wait_future().await.is_ok() && process.is_successful();
-        if ok && let Err(e) = download::finish(&plan) {
-            eprintln!("updating {}: {e:#}", plan.dir.display());
+        if ok {
+            // Stop came too late to matter.
+            job.stopped.set(false);
+            if let Err(e) = download::finish(&paths, &plan) {
+                eprintln!("updating {}: {e:#}", plan.dir.display());
+            }
         }
         if let Some(app) = weak.upgrade() {
             let failure = (!ok).then(|| Vec::from(tail).join("\n"));
@@ -202,10 +233,10 @@ fn run(app: &Rc<App>, plan: Plan, job: Rc<Job>) {
 fn ended(app: &Rc<App>, job: &Rc<Job>, title: &str, failure: Option<String>) {
     let title = isolate(title);
     let toast = if job.stopped.get() {
-        job.show_stopped();
+        job.show_stopped(&title);
         format!("Stopped downloading {title}")
     } else if let Some(details) = failure {
-        job.failed(&details);
+        job.failed(&title, &details);
         format!("Download of {title} failed")
     } else {
         job.done(&format!("Downloaded {title}"));
@@ -256,7 +287,11 @@ impl Downloads {
     fn begin(&self, job: &Rc<Job>) {
         job.working.set(true);
         job.show_minimize(true);
-        self.jobs.borrow_mut().push(job.clone());
+        let mut jobs = self.jobs.borrow_mut();
+        if !jobs.iter().any(|j| Rc::ptr_eq(j, job)) {
+            jobs.push(job.clone());
+        }
+        drop(jobs);
         self.update_button();
     }
 
@@ -278,10 +313,13 @@ impl Downloads {
         job.expand.set_visible(true);
 
         if !job.wired.replace(true) {
-            let (weak, job_weak) = (Rc::downgrade(self), Rc::downgrade(job));
+            let (weak, job_weak, app_weak) =
+                (Rc::downgrade(self), Rc::downgrade(job), Rc::downgrade(app));
             job.dismiss.connect_clicked(move |_| {
-                if let (Some(downloads), Some(job)) = (weak.upgrade(), job_weak.upgrade()) {
-                    downloads.dismiss(&job);
+                if let (Some(downloads), Some(job), Some(app)) =
+                    (weak.upgrade(), job_weak.upgrade(), app_weak.upgrade())
+                {
+                    downloads.dismiss(&app, &job);
                 }
             });
             let (weak, job_weak, app_weak) =
@@ -308,7 +346,7 @@ impl Downloads {
         job.dismiss.set_visible(false);
         job.expand.set_visible(false);
         // A finished download closed from its dialog is simply gone, like a dismissed one.
-        if !job.working.get() {
+        if !job.working.get() && !job.can_resume() {
             self.jobs.borrow_mut().retain(|j| !Rc::ptr_eq(j, job));
         }
         self.update_button();
@@ -332,17 +370,48 @@ impl Downloads {
         job.process.take();
         job.stop.set_visible(false);
         job.show_minimize(false);
+        job.resume.set_visible(job.can_resume());
+        job.dismiss.set_tooltip_text(Some(if job.can_resume() {
+            "Don’t resume this download; its files stay"
+        } else {
+            "Remove from the list"
+        }));
         if job.adopted.get() {
             job.dismiss.set_visible(true);
-        } else {
+        } else if !job.can_resume() {
             self.jobs.borrow_mut().retain(|j| !Rc::ptr_eq(j, job));
         }
         self.update_button();
     }
 
-    fn dismiss(&self, job: &Rc<Job>) {
+    fn dismiss(&self, app: &App, job: &Rc<Job>) {
+        if let Some(plan) = job.plan.take()
+            && let Err(e) = download::forget(&app.paths, &plan)
+        {
+            eprintln!("forgetting {}: {e:#}", plan.url);
+        }
         self.detach(job);
         self.jobs.borrow_mut().retain(|j| !Rc::ptr_eq(j, job));
+        self.update_button();
+    }
+
+    /// Drops a stopped entry for what `job` is now downloading: it would only offer to resume
+    /// the same thing twice.
+    fn replace_idle(&self, job: &Rc<Job>) {
+        let same = |j: &Rc<Job>| !Rc::ptr_eq(j, job) && !j.working.get() && j.plan_matches(job);
+        let stale: Vec<Rc<Job>> = self
+            .jobs
+            .borrow()
+            .iter()
+            .filter(|j| same(j))
+            .cloned()
+            .collect();
+        for old in stale {
+            if old.adopted.get() {
+                self.detach(&old);
+            }
+            self.jobs.borrow_mut().retain(|j| !Rc::ptr_eq(j, &old));
+        }
         self.update_button();
     }
 
@@ -400,6 +469,8 @@ struct Job {
     file_size: gtk::Label,
     detail: gtk::Label,
     stop: gtk::Button,
+    /// Continues a stopped or failed download.
+    resume: gtk::Button,
     /// Removes a finished download from the list.
     dismiss: gtk::Button,
     /// Brings a listed download back into a dialog.
@@ -421,11 +492,13 @@ struct Job {
     stopped: Cell<bool>,
     /// The course folder, so it isn't downloaded into twice at once.
     dir: RefCell<Option<PathBuf>>,
+    /// What's being downloaded, until it finishes. Kept after a stop or failure to resume it.
+    plan: RefCell<Option<Plan>>,
     process: RefCell<Option<gio::Subprocess>>,
 }
 
 impl Job {
-    fn new() -> Rc<Self> {
+    fn new(app: &Rc<App>) -> Rc<Self> {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -460,7 +533,11 @@ impl Job {
         log_toggle.add_css_class("flat");
         log_toggle.add_css_class("circular");
         log_toggle.connect_toggled(|t| {
-            t.set_tooltip_text(Some(if t.is_active() { "Hide log" } else { "Show log" }));
+            t.set_tooltip_text(Some(if t.is_active() {
+                "Hide log"
+            } else {
+                "Show log"
+            }));
         });
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         top.append(&heading);
@@ -477,9 +554,16 @@ impl Job {
             .tooltip_text("Stop downloading; what’s downloaded is kept")
             .visible(false)
             .build();
+        let resume_button = gtk::Button::builder()
+            .label("Resume")
+            .tooltip_text("Continue from what’s already downloaded")
+            .visible(false)
+            .build();
+        resume_button.add_css_class("suggested-action");
         let middle = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         middle.append(&bar);
         middle.append(&stop);
+        middle.append(&resume_button);
 
         let status = label("", &[]);
         let file_title = label("", &["caption"]);
@@ -539,11 +623,17 @@ impl Job {
         let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
         page.append(&root);
 
-        Rc::new_cyclic(|weak: &Weak<Job>| {
-            let weak = weak.clone();
+        Rc::new_cyclic(|weak_job: &Weak<Job>| {
+            let weak = weak_job.clone();
             stop.connect_clicked(move |_| {
                 if let Some(job) = weak.upgrade() {
                     job.stop();
+                }
+            });
+            let (weak, app) = (weak_job.clone(), Rc::downgrade(app));
+            resume_button.connect_clicked(move |_| {
+                if let (Some(job), Some(app)) = (weak.upgrade(), app.upgrade()) {
+                    resume(&app, &job);
                 }
             });
             Self {
@@ -558,6 +648,7 @@ impl Job {
                 file_size,
                 detail,
                 stop,
+                resume: resume_button,
                 dismiss,
                 expand,
                 log,
@@ -569,9 +660,22 @@ impl Job {
                 adopted: Cell::new(false),
                 stopped: Cell::new(false),
                 dir: RefCell::new(None),
+                plan: RefCell::new(None),
                 process: RefCell::new(None),
             }
         })
+    }
+
+    fn can_resume(&self) -> bool {
+        self.plan.borrow().is_some()
+    }
+
+    /// Whether `other` is downloading the same thing as this job.
+    fn plan_matches(&self, other: &Job) -> bool {
+        match (&*self.plan.borrow(), &*other.plan.borrow()) {
+            (Some(a), Some(b)) => a.same_download(b),
+            _ => false,
+        }
     }
 
     fn stop(&self) {
@@ -598,6 +702,7 @@ impl Job {
     fn started(&self, plan: &Plan, process: &gio::Subprocess) {
         *self.process.borrow_mut() = Some(process.clone());
         self.stop.set_visible(true);
+        self.stop.set_sensitive(true);
         self.heading
             .set_label(&format!("Downloading {}", isolate(&plan.title)));
         self.status.set_label(&plan.dir.display().to_string());
@@ -643,7 +748,8 @@ impl Job {
 
     /// Appends to the log, keeping the last `LOG_LINES` and following the newest.
     fn log_line(&self, line: &str) {
-        self.log.insert(&mut self.log.end_iter(), &format!("{line}\n"));
+        self.log
+            .insert(&mut self.log.end_iter(), &format!("{line}\n"));
         let extra = self.log.line_count() - LOG_LINES;
         if extra > 0
             && let Some(mut cut) = self.log.iter_at_line(extra)
@@ -652,7 +758,9 @@ impl Job {
         }
         let mark = match self.log.mark("end") {
             Some(mark) => mark,
-            None => self.log.create_mark(Some("end"), &self.log.end_iter(), false),
+            None => self
+                .log
+                .create_mark(Some("end"), &self.log.end_iter(), false),
         };
         self.log.move_mark(&mark, &self.log.end_iter());
         self.log_view.scroll_mark_onscreen(&mark);
@@ -666,6 +774,7 @@ impl Job {
     }
 
     fn done(&self, text: &str) {
+        self.plan.take();
         self.heading.set_label(text);
         self.bar.set_fraction(1.0);
         self.file.set_visible(false);
@@ -673,19 +782,49 @@ impl Job {
         self.detail.set_label("New lectures appear in Courses.");
     }
 
-    fn failed(&self, details: &str) {
-        self.heading.set_label("Download failed");
+    fn failed(&self, title: &str, details: &str) {
+        self.heading
+            .set_label(&format!("Download of {title} failed"));
         self.detail.set_label(details);
         self.detail.remove_css_class("dim-label");
         self.detail.add_css_class("error");
     }
 
-    fn show_stopped(&self) {
-        self.heading.set_label("Download stopped");
-        self.detail.set_label(if self.dir.borrow().is_some() {
-            "What’s downloaded is kept; Download New resumes it."
-        } else {
-            "What’s downloaded is kept; adding the video again resumes it."
-        });
+    fn show_stopped(&self, title: &str) {
+        self.heading
+            .set_label(&format!("Download of {title} stopped"));
+        let plan = self.plan.borrow();
+        let url = plan.as_ref().map_or("", |p| p.url.as_str());
+        self.detail.set_label(&format!(
+            "What’s downloaded is kept; Resume continues from there.\n{url}"
+        ));
+    }
+
+    /// A download left unfinished by an earlier run of the app.
+    fn restored(&self, plan: Plan) {
+        *self.title.borrow_mut() = plan.title.clone();
+        self.status.set_label(&plan.dir.display().to_string());
+        if plan.source.is_some() {
+            *self.dir.borrow_mut() = Some(plan.dir.clone());
+        }
+        let title = isolate(&plan.title);
+        *self.plan.borrow_mut() = Some(plan);
+        self.show_stopped(&title);
+        self.resume.set_visible(true);
+        self.dismiss
+            .set_tooltip_text(Some("Don’t resume this download; its files stay"));
+    }
+
+    /// Back to how a new download looks.
+    fn resuming(&self) {
+        self.stopped.set(false);
+        self.resume.set_visible(false);
+        self.dismiss.set_visible(false);
+        self.dismiss.set_tooltip_text(Some("Remove from the list"));
+        self.heading.set_label("Resuming…");
+        self.detail.set_label("");
+        self.detail.remove_css_class("error");
+        self.detail.add_css_class("dim-label");
+        self.status.set_visible(true);
     }
 }

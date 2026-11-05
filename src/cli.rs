@@ -778,11 +778,11 @@ pub fn add(url: String, name: Option<String>) -> Result<()> {
     println!("{}", dim(&format!("Looking up {url} …")));
     let plan = download::plan(&session.cfg, &url, name.as_deref())?;
     println!("Downloading {}", bold(&plan.describe()));
-    download::prepare(&plan)?;
+    download::prepare(&session.paths, &plan)?;
     if !run(download::download_args(&session.cfg, &plan, false))? {
         bail!("download stopped; run `patrak update` to resume it");
     }
-    download::finish(&plan)?;
+    download::finish(&session.paths, &plan)?;
     after_launch(&mut session)
 }
 
@@ -800,10 +800,27 @@ pub fn update(query: Option<String>, check_only: bool) -> Result<()> {
                 .is_none_or(|q| name.contains(&q.to_lowercase()))
         })
         .collect();
-    if dirs.is_empty() {
+    // Single videos have no folder for the loop below to find. Courses resume through it.
+    let videos: Vec<download::Plan> = download::pending(&session.paths)
+        .into_iter()
+        .filter(|p| p.source.is_none())
+        .filter(|p| {
+            query
+                .as_deref()
+                .is_none_or(|q| p.title.to_lowercase().contains(&q.to_lowercase()))
+        })
+        .collect();
+    if dirs.is_empty() && videos.is_empty() {
         bail!("no downloaded courses match; add one with `patrak add <playlist-url>`");
     }
     let mut downloaded = false;
+    for plan in &videos {
+        println!("{}  {}", bold(&plan.title), green("not finished"));
+        if !check_only && run(download::download_args(&session.cfg, plan, false))? {
+            download::finish(&session.paths, plan)?;
+            downloaded = true;
+        }
+    }
     for dir in dirs {
         let name = dir
             .file_name()
@@ -824,7 +841,7 @@ pub fn update(query: Option<String>, check_only: bool) -> Result<()> {
         }
         let plan = download::update_plan(&dir).context("course has no source")?;
         if run(download::download_args(&session.cfg, &plan, false))? {
-            download::finish(&plan)?;
+            download::finish(&session.paths, &plan)?;
             downloaded = true;
         }
     }

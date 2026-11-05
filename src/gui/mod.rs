@@ -314,6 +314,7 @@ impl App {
         app.install_actions(gtk_app);
         app.update_banner();
         app.watch_sources();
+        download_dialog::restore(&app);
 
         let weak = Rc::downgrade(&app);
         app.banner.connect_button_clicked(move |_| {
@@ -735,7 +736,7 @@ impl App {
         let alert = adw::AlertDialog::new(
             Some("Stop Downloads?"),
             Some(&format!(
-                "{what} still running. What’s downloaded so far is kept, and Download New resumes it."
+                "{what} still running. What’s downloaded so far is kept, and you can resume it from the downloads button."
             )),
         );
         alert.add_responses(&[("cancel", "Keep Downloading"), ("quit", "Stop and Quit")]);

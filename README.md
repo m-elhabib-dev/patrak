@@ -148,7 +148,7 @@ Give a course a deadline in its **Plan** row (Courses page) or with `patrak dead
 
 ```sh
 patrak add "https://www.youtube.com/playlist?list=…"    # or the + button in the window
-patrak update                                           # fetch new episodes of every added course
+patrak update                                           # fetch new episodes and resume stopped downloads
 patrak update --check                                   # only list what's new
 ```
 
@@ -159,6 +159,8 @@ patrak update --check                                   # only list what's new
 - Each folder gets two hidden files: `.patrak-source.json` and `.patrak-archive.txt`, the record
   of downloaded videos. Moving the folder keeps the link.
 - The window checks each playlist for new episodes about once a day.
+- Stopping a download keeps its link and partial files. Unfinished downloads stay in the header's
+  downloads list, even after a restart, and Resume continues them where they left off.
 
 yt-dlp options come from `yt_dlp` and `yt_dlp_args` in `config.toml`. If YouTube refuses downloads
 (HTTP 403), update yt-dlp or add browser cookies:
@@ -207,7 +209,7 @@ patrak note [query]      edit notes in $EDITOR
 patrak done/reset <q>    mark a lecture or book done or not done
 patrak deadline <c> <w>  set or clear a course deadline
 patrak add <url>         download a playlist as a course (--name to choose the folder)
-patrak update [course]   download new episodes (--check to only list them)
+patrak update [course]   download new episodes and resume stopped downloads (--check to only list)
 patrak review            review the cards due today
 patrak habits            today's habits against their goals
 patrak habit <h> [n]     log a habit: n sets today's amount, +n or -n changes it
