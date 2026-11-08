@@ -34,22 +34,8 @@ impl BooksPage {
             "books"
         });
 
-        let reading: Vec<_> = snap
-            .books
-            .iter()
-            .filter(|b| !b.is_done() && b.position > 0.0)
-            .collect();
-        let unread: Vec<_> = snap
-            .books
-            .iter()
-            .filter(|b| !b.is_done() && b.position <= 0.0)
-            .collect();
-        let finished: Vec<_> = snap.books.iter().filter(|b| b.is_done()).collect();
-        for (title, books) in [
-            ("Reading", reading),
-            ("Not Started", unread),
-            ("Finished", finished),
-        ] {
+        let (finished, unfinished): (Vec<_>, Vec<_>) = snap.books.iter().partition(|b| b.is_done());
+        for (title, books) in [("Unfinished", unfinished), ("Finished", finished)] {
             if books.is_empty() {
                 continue;
             }

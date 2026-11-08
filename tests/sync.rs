@@ -224,6 +224,53 @@ fn deleted_files_keep_their_progress_but_cannot_be_played() {
 }
 
 #[test]
+fn lists_put_unfinished_first_oldest_added_first() {
+    let mut fx = Fixture::new(true);
+    fx.sync();
+    for f in ["Videos/Go/01 Start.mp4", "Books/newer.pdf"] {
+        let p = fx.root.join(f);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, b"another file").unwrap();
+    }
+    fx.sync();
+
+    let snap = fx.snapshot();
+    let courses = |s: &progress::Snapshot| -> Vec<String> {
+        s.courses.iter().map(|c| c.name.clone()).collect()
+    };
+    let books = |s: &progress::Snapshot| -> Vec<String> {
+        s.books.iter().map(|b| b.title.clone()).collect()
+    };
+    assert_eq!(courses(&snap), ["Rust", "Go"]);
+    assert_eq!(books(&snap), ["book", "newer"]);
+
+    // Activity doesn't reorder the lists, but "continue" still follows it.
+    let rust = &snap.courses[0];
+    assert_eq!(rust.lectures.len(), 3);
+    let go_id = snap.courses[1].lectures[0].id;
+    let (old_book, new_book) = (snap.books[0].id, snap.books[1].id);
+    db::set_position(&fx.conn, rust.lectures[0].id, 5.0, 100).unwrap();
+    db::set_position(&fx.conn, go_id, 5.0, 200).unwrap();
+    db::set_position(&fx.conn, old_book, 5.0, 100).unwrap();
+    db::set_position(&fx.conn, new_book, 5.0, 200).unwrap();
+    let rust_ids: Vec<i64> = rust.lectures.iter().map(|l| l.id).collect();
+    let snap = fx.snapshot();
+    assert_eq!(courses(&snap), ["Rust", "Go"]);
+    assert_eq!(books(&snap), ["book", "newer"]);
+    assert_eq!(snap.current_course().unwrap().name, "Go");
+    assert_eq!(snap.last_book().unwrap().title, "newer");
+
+    // Finishing sinks them to the bottom.
+    for id in rust_ids {
+        set_done(&fx.conn, id, true).unwrap();
+    }
+    set_done(&fx.conn, old_book, true).unwrap();
+    let snap = fx.snapshot();
+    assert_eq!(courses(&snap), ["Go", "Rust"]);
+    assert_eq!(books(&snap), ["newer", "book"]);
+}
+
+#[test]
 fn moved_files_keep_their_progress() {
     let mut fx = Fixture::new(true);
     fx.sync();

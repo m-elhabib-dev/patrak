@@ -7,6 +7,7 @@ use crate::review;
 use anyhow::Result;
 use chrono::{Datelike, Duration, NaiveDate};
 use rusqlite::Connection;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -124,6 +125,16 @@ impl Course {
 
     pub fn is_single_file(&self) -> bool {
         self.lectures.len() == 1
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.done == self.lectures.len()
+    }
+
+    /// Orders courses by when they joined the library: ids only grow, and new episodes
+    /// of a course don't count as adding it again.
+    fn added(&self) -> i64 {
+        self.lectures.iter().map(|l| l.id).min().unwrap_or(0)
     }
 }
 
@@ -281,7 +292,16 @@ impl Snapshot {
                 a.left_today(self.today)
                     .total_cmp(&b.left_today(self.today))
             })
-            .or_else(|| self.courses.iter().find(|c| c.next.is_some()))
+            .or_else(|| {
+                self.courses
+                    .iter()
+                    .filter(|c| c.next.is_some())
+                    .min_by(|a, b| {
+                        b.last_active
+                            .cmp(&a.last_active)
+                            .then_with(|| natord::compare(&a.name, &b.name))
+                    })
+            })
     }
 
     /// Courses with a deadline that aren't finished, soonest deadline first.
@@ -301,7 +321,8 @@ impl Snapshot {
     pub fn last_book(&self) -> Option<&Item> {
         self.books
             .iter()
-            .find(|b| !b.is_done() && !b.missing && b.position_ts > 0)
+            .filter(|b| !b.is_done() && !b.missing && b.position_ts > 0)
+            .min_by_key(|b| (Reverse(touched(b)), b.ord))
     }
 
     pub fn item(&self, id: i64) -> Option<&Item> {
@@ -522,14 +543,11 @@ pub fn build(conn: &Connection, cfg: &Config) -> Result<Snapshot> {
             c
         })
         .collect();
-    courses.sort_by(|a, b| {
-        b.last_active
-            .cmp(&a.last_active)
-            .then_with(|| natord::compare(&a.name, &b.name))
-    });
+    // Unfinished first, each group oldest-added first.
+    courses.sort_by_key(|c| (c.is_finished(), c.added()));
 
     let mut books: Vec<Item> = items.into_iter().filter(|i| i.kind == Kind::Book).collect();
-    books.sort_by(|a, b| touched(b).cmp(&touched(a)).then(a.ord.cmp(&b.ord)));
+    books.sort_by_key(|b| (b.is_done(), b.id));
 
     let (streak, best_streak) = streaks(&days, goals, &holidays, today);
     Ok(Snapshot {
